@@ -124,12 +124,18 @@
  *
  *  WIFI
  *    If the saved network can't be joined at power-up, the lamp opens the
- *    "Lamp Setup" portal by itself (first boot, new router). No touch can
- *    erase credentials; only the serial RESET_WIFI does that.
+ *    "Lamp Setup" portal by itself (first boot, new router). To pick a
+ *    different network while the old one still works: unplug, plug back in,
+ *    and within WIFI_PORTAL_WINDOW_MS make a plain hold of WIFI_PORTAL_HOLD_MS.
+ *    It blinks three times and reboots into "Lamp Setup" — without forgetting
+ *    anything. The saved network stays until a new one is chosen; if nobody
+ *    chooses, the portal times out and the lamp rejoins the old one. No touch
+ *    can erase credentials; only the serial RESET_WIFI does that.
  *
  *  NON-BLOCKING
- *    There is no delay() anywhere below setup() except RESET_WIFI, which runs
- *    immediately before ESP.restart(). Everything is millis()-driven.
+ *    There is no delay() anywhere below setup() except the portal blinks and
+ *    RESET_WIFI, which run immediately before ESP.restart(). Everything is
+ *    millis()-driven.
  * ============================================================================
  */
 
@@ -141,6 +147,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <WiFiManager.h>
 #include <esp_system.h>
+#include <esp_attr.h>
 #include <time.h>
 
 #include "config.h"
@@ -303,6 +310,9 @@ static const uint32_t SECRET_LATE_MS       = 4000;   // a show arriving later th
 static const uint32_t HOLD_HEARTBEAT_MS    = 1000;   // HOLD_START repeat while holding
 static const uint32_t HOLD_TIMEOUT_MS      = 3000;   // no repeat for this long = hold over
 
+static const uint32_t WIFI_PORTAL_WINDOW_MS = 30000; // after power-up
+static const uint32_t WIFI_PORTAL_HOLD_MS   = 10000;
+
 static const uint32_t FRAME_MS             = 16;     // ~60fps render tick
 
 static const uint32_t MQTT_RETRY_MS        = 5000;
@@ -452,9 +462,15 @@ static uint32_t epochAtSync  = 0;
 static uint32_t millisAtSync = 0;
 
 // Connectivity.
+static uint32_t loopStartedAt = 0;
 static uint32_t wifiDownSince = 0;
 static uint32_t lastMqttAttempt = 0;
 static uint32_t lastFrameAt = 0;
+
+// Survives ESP.restart() (not a power cut), so the next boot knows the
+// WiFi-change hold asked for "Lamp Setup".
+static RTC_NOINIT_ATTR uint32_t portalRequest;
+static const uint32_t PORTAL_MAGIC = 0x5E7A9B1C;
 
 static String topicSignalSelf, topicSignalPeer, topicStatusSelf, topicStatusPeer;
 
@@ -1516,6 +1532,23 @@ static void renderFrame() {
 //  TOUCH
 // ============================================================================
 
+// The WiFi-change hold: a plain 10 s hold within 30 s of power-up. Blinks,
+// then reboots into "Lamp Setup" without forgetting anything: the saved
+// network stays until a new one is chosen there, and if nobody chooses, the
+// portal times out and the lamp rejoins it. No touch can erase credentials.
+static void requestSetupPortal() {
+    Serial.println("[wifi] setup hold after power-up — opening Lamp Setup");
+    if (localHoldLive()) publishHold("HOLD_END");
+    Px on[NUM_PIXELS], off[NUM_PIXELS] = {};
+    for (uint8_t i = 0; i < NUM_PIXELS; i++) on[i] = px(COOL_WHITE, MAX_LEVEL);
+    for (uint8_t i = 0; i < 3; i++) {   // delay()s are fine here: we reboot next
+        writeRing(on);  delay(250);
+        writeRing(off); delay(250);
+    }
+    portalRequest = PORTAL_MAGIC;
+    ESP.restart();
+}
+
 // The lamp light: a double tap with nothing to answer turns this lamp into an
 // ordinary lamp, and another turns it off again. Local only: hers doesn't
 // change. Ignored while a hold, a show or her tap is playing; your own tap's
@@ -1584,6 +1617,9 @@ static void serviceTouch() {
             bool quick = pressStartedAt - burstStartedAt <= SEQUENCE_WINDOW_MS;
             holdAfterTaps(quick ? tapCount : 0);
         }
+        if (now - loopStartedAt < WIFI_PORTAL_WINDOW_MS &&
+            now - pressStartedAt >= WIFI_PORTAL_HOLD_MS &&
+            localHoldLive() && localLook == L_PLAIN && mode != M_SHARED) requestSetupPortal();
     } else if (!touchStable && touchHeld) {             // release
         touchHeld = false;
         if (holdActive) endLocalHold();
@@ -1729,6 +1765,17 @@ void setup() {
     wm.setConfigPortalTimeout(300);
     wm.setConnectTimeout(20);
 
+    // The WiFi-change hold asked for this on the way down. The saved network
+    // is kept: choosing a new one in the portal replaces it, and letting the
+    // portal time out leaves it as it was.
+    bool portalAsked = portalRequest == PORTAL_MAGIC;
+    portalRequest = 0;
+    if (portalAsked) {
+        Serial.println("[wifi] opening Lamp Setup, as asked by the setup hold");
+        if (!wm.startConfigPortal("Lamp Setup"))
+            Serial.println("[wifi] Lamp Setup closed with nothing chosen — keeping the saved network");
+    }
+
     // Blocking whenever the saved network can't be joined — first boot, after
     // a credential wipe, or when her router has changed: opens an AP called
     // "Lamp Setup" with a captive portal. The ring stays dark in here.
@@ -1747,6 +1794,8 @@ void setup() {
     mqtt.setCallback(onMqttMessage);
     mqtt.setBufferSize(512);
     mqtt.setKeepAlive(30);
+
+    loopStartedAt = millis();
 }
 
 void loop() {
