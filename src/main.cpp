@@ -146,6 +146,7 @@
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
 #include <WiFiManager.h>
+#include <esp_task_wdt.h>
 #include <esp_system.h>
 #include <esp_attr.h>
 #include <time.h>
@@ -315,7 +316,11 @@ static const uint32_t WIFI_PORTAL_HOLD_MS   = 10000;
 
 static const uint32_t FRAME_MS             = 16;     // ~60fps render tick
 
-static const uint32_t MQTT_RETRY_MS        = 5000;
+static const uint32_t WIFI_DEAD_REBOOT_MS  = 5UL * 60UL * 1000UL;
+static const uint32_t MQTT_RETRY_BASE_MS   = 5000;
+static const uint32_t MQTT_RETRY_MAX_MS    = 60000;
+static const uint8_t  MQTT_FAILS_TO_WIFI_KICK = 6;
+static const uint32_t WDT_TIMEOUT_S        = 30;
 
 // ============================================================================
 //  STATE
@@ -465,6 +470,8 @@ static uint32_t millisAtSync = 0;
 static uint32_t loopStartedAt = 0;
 static uint32_t wifiDownSince = 0;
 static uint32_t lastMqttAttempt = 0;
+static uint32_t mqttBackoff = MQTT_RETRY_BASE_MS;
+static uint8_t  mqttFails = 0;
 static uint32_t lastFrameAt = 0;
 
 // Survives ESP.restart() (not a power cut), so the next boot knows the
@@ -1651,17 +1658,24 @@ static void serviceWifi() {
         Serial.println("[wifi] link down, reconnecting");
         WiFi.reconnect();
     }
+    // Five minutes down with no recovery: stop guessing, just reboot.
+    if (millis() - wifiDownSince > WIFI_DEAD_REBOOT_MS) {
+        Serial.println("[wifi] dead 5min — rebooting");
+        ESP.restart();
+    }
 }
 
 static void serviceMqtt() {
     if (mqtt.connected()) {
         mqtt.loop();
+        mqttFails = 0;
+        mqttBackoff = MQTT_RETRY_BASE_MS;
         return;
     }
     if (WiFi.status() != WL_CONNECTED) return;
 
     uint32_t now = millis();
-    if (now - lastMqttAttempt < MQTT_RETRY_MS) return;
+    if (now - lastMqttAttempt < mqttBackoff) return;
     lastMqttAttempt = now;
 
     String cid = String("lamp-") + DEVICE_ID + "-" +
@@ -1681,10 +1695,20 @@ static void serviceMqtt() {
         mqtt.publish(topicSignalSelf.c_str(), (const uint8_t*)"", 0, true);
         mqtt.subscribe(topicSignalPeer.c_str(), 1);
         mqtt.subscribe(topicStatusPeer.c_str(), 1);
+        mqttFails = 0;
+        mqttBackoff = MQTT_RETRY_BASE_MS;
         lastHeartbeatAt = 0;    // still holding? tell her straight away
     } else {
         // rc=-2 is almost always the root CA. rc=4/5 is bad credentials.
         Serial.printf("failed, rc=%d\n", mqtt.state());
+        mqttFails++;
+        mqttBackoff = min(mqttBackoff * 2, MQTT_RETRY_MAX_MS);
+        if (mqttFails >= MQTT_FAILS_TO_WIFI_KICK) {
+            Serial.println("[mqtt] 6 failures — kicking WiFi");
+            mqttFails = 0;
+            WiFi.disconnect();
+            WiFi.reconnect();
+        }
     }
 }
 
@@ -1795,10 +1819,27 @@ void setup() {
     mqtt.setBufferSize(512);
     mqtt.setKeepAlive(30);
 
+    // Watchdog LAST. Armed before the portal above, it fired 30s into a
+    // 5-minute setup and rebooted the lamp while you were still typing the
+    // WiFi password. The API changed in ESP32 Arduino core 3.x, hence the guard.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    esp_task_wdt_config_t wdt = {
+        .timeout_ms = WDT_TIMEOUT_S * 1000,
+        .idle_core_mask = 0,
+        .trigger_panic = true
+    };
+    esp_task_wdt_init(&wdt);
+#else
+    esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
+    esp_task_wdt_add(NULL);
+
     loopStartedAt = millis();
 }
 
 void loop() {
+    esp_task_wdt_reset();
+
     serviceWifi();
     serviceMqtt();
     serviceTime();
