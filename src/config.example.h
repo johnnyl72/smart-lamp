@@ -86,21 +86,23 @@
 #define LAMP_AUTO_OFF_MS (5UL * 60UL * 60UL * 1000UL)
 
 // ---------------------------------------------------------------------------
-// FEELINGS — quick runs of taps
+// FEELINGS AND PARTY — quick runs of taps
 // ---------------------------------------------------------------------------
 // Set these the same on both lamps.
 
 // 0 keeps only the everyday gestures (tap, tap back, hold, hold together,
-// lamp light). 1 adds the feelings.
+// lamp light). 1 adds the feelings and the party.
 #define SECRETS_ENABLED 1
 
 // The longest a run of quick taps may take, first press to last release, in
 // ms. Slower runs are ignored, so a slow 3-tap isn't mistaken for a feeling.
 #define SEQUENCE_WINDOW_MS 2500
 
-// A feeling plays until a tap on either lamp, or this long at most, in ms,
-// so one left playing in an empty room still ends. Not the lamp light, which
-// has LAMP_AUTO_OFF_MS.
+// A feeling or the party plays until a tap on either lamp, or this long at
+// most, in ms, so one left playing in an empty room still ends. The party
+// takes 100 s to show all ten effects, then goes round again; much under
+// that and it ends before she's seen them all. Not the lamp light, which has
+// LAMP_AUTO_OFF_MS.
 #define SHOW_AUTO_OFF_MS (5UL * 60UL * 1000UL)
 
 // NTP. Keeps hold-together and the shows in step on both lamps.

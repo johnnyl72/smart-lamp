@@ -6,8 +6,9 @@
  *  Two lamps. Both run this identical firmware; DEVICE_ID in config.h ("A" or
  *  "B") is the only difference. Everyday light is the aurora: mint, cyan, sky,
  *  lavender and pink, with cool-white highlights. Happy uses the pastel
- *  rainbow, mellow deep blues and love warm pinks. Idle is dark. Every
- *  animation draws each LED on the ring separately, so light moves round it.
+ *  rainbow, mellow deep blues, love warm pinks and the party the full
+ *  saturated spectrum. Idle is dark. Every animation draws each LED on the
+ *  ring separately, so light moves round it.
  *
  *  GESTURES — on your own lamp
  *    Tap            "I miss you". On her lamp aurora light blooms both ways
@@ -41,18 +42,20 @@
  *                   while you both hold. Either letting go fades both out
  *                   over 3 s. Nothing resumes.
  *
- *  FEELINGS (SECRETS_ENABLED) — a burst of quick taps
+ *  FEELINGS AND PARTY (SECRETS_ENABLED) — a burst of quick taps
  *    3 taps             Happy     a fast, fluttering rainbow
  *    4 taps             Mellow    slow deep blues, with ice falling
  *    5 taps             Love      pink heartbeats
- *    6+ taps            nothing, so mashing the lamp sets nothing off
- *  Feelings play on both lamps until a tap on either, or for
+ *    6 taps             Party     all ten effects in turn, 10 s each, in an
+ *                                 order shuffled by the show's seed
+ *    7+ taps            nothing, so mashing the lamp sets nothing off
+ *  Feelings and the party play on both lamps until a tap on either, or for
  *  SHOW_AUTO_OFF_MS at most. That tap ends the show on both and isn't sent
  *  as a tap. A run of taps just before a hold is dropped: it's a plain hold.
  *
  *  PRIORITY — one mode drives the LEDs at a time
  *      1 hold together   2 live hold (hers or yours)
- *      3 the answer      4 her tap waiting, or a feeling: these
+ *      3 the answer      4 her tap waiting, or a feeling or party: these
  *                          share a level, so the newest wins
  *      6 your tap waiting, idle, the lamp light (and fades): anything may
  *        interrupt these
@@ -90,12 +93,12 @@
  *    lamp loses its own connection.
  *
  *  SHOWS — decided once, by the lamp that saw them
- *    The lamp whose sensor recognised a feeling works out which
+ *    The lamp whose sensor recognised a feeling or a party works out which
  *    show it is and publishes SECRET_GESTURE; the other lamp just plays it,
  *    so the two never disagree. "at" is a moment SECRET_LEAD_MS ahead on the
  *    shared NTP clock, so both lamps start together; one arriving
  *    SECRET_LATE_MS after that is dropped. "seed" makes both lamps' random
- *    patterns identical. A show is
+ *    patterns identical, the party's order of effects included. A show is
  *    only played here if it went out: offline, the lamp sends its tap spark
  *    instead.
  *
@@ -182,6 +185,20 @@ static const Rgb LOVE[]     = { PASTELS[0], PASTELS[1], ROSE };
 static const Rgb MELLOW[]   = { { 70, 110, 255 }, { 120, 160, 255 }, PASTELS[4], PASTELS[5], { 150, 130, 255 } };
 static const uint8_t MELLOW_COUNT = sizeof(MELLOW) / sizeof(MELLOW[0]);
 
+// Party only: the whole spectrum, saturated. No pure red: saturated red
+// flashing is the worst kind for photosensitive viewers.
+static const Rgb SPECTRUM[] = {
+    { 255,   0, 150 },   // 0 hot pink
+    { 170,   0, 255 },   // 1 violet
+    {  40,  60, 255 },   // 2 blue
+    {   0, 200, 255 },   // 3 cyan
+    {   0, 255, 140 },   // 4 green
+    { 150, 255,   0 },   // 5 lime
+    { 255, 200,   0 },   // 6 gold
+    { 255, 110,   0 },   // 7 orange
+};
+static const uint8_t SPECTRUM_COUNT = sizeof(SPECTRUM) / sizeof(SPECTRUM[0]);
+
 // Brightest any animation may get, as a fraction of MAX_BRIGHTNESS (which
 // stays the USB power cap). Enforced once, per LED, in writeRing().
 static const float MAX_LEVEL = 0.70f;
@@ -221,7 +238,7 @@ static const float LED_GAMMA = 2.6f;
 
 // A run MASH_TAPS long or longer is mashing, and does nothing; before a hold
 // it's dropped like any other run, leaving a plain hold.
-static const uint8_t  MASH_TAPS            = 6;
+static const uint8_t  MASH_TAPS            = 7;
 
 static const uint32_t DEBOUNCE_MS          = 40;
 
@@ -251,6 +268,12 @@ static const uint32_t MELLOW_SWELL_MS      = 16000;  // mellow's swell, once rou
 static const uint8_t  FALL_SPECKS          = 6;      // mellow's ice, falling at once
 static const uint32_t LOVE_BEAT_MS         = 1200;   // love, one lub-dub
 static const uint32_t LOVE_DRIFT_MS        = 9000;   // love's warm glow, once round
+static const uint32_t PARTY_MS             = 10000;  // each party effect plays this long,
+static const uint32_t PARTY_FADE_MS        = 800;    //   fading into the next over this
+static const uint32_t CONFETTI_SLOT_MS     = 500;    // each LED's chance to pop comes round this often
+// Bass line's beat: 128 bpm. The whole ring kicks once a beat, so never below
+// 334 ms (3 flashes a second, the photosensitive-epilepsy limit).
+static const uint32_t BASS_BEAT_MS         = 469;
 static const uint32_t SECRET_LEAD_MS       = 250;    // shows start this far ahead, so hers can start with yours
 static const uint32_t SECRET_LATE_MS       = 4000;   // a show arriving later than this is dropped
 
@@ -279,7 +302,7 @@ enum Mode : uint8_t {
     M_LAMP_OFF,   // lamp light: collapsing back into a point, then dark
     // Shows: both lamps, until a tap or SHOW_AUTO_OFF_MS, then a fade. Keep
     // them last; isShow() relies on it.
-    M_HAPPY, M_MELLOW, M_LOVE
+    M_HAPPY, M_MELLOW, M_LOVE, M_PARTY
 };
 
 struct Show { const char* name; Mode mode; };
@@ -287,6 +310,7 @@ static const Show SHOWS[] = {
     { "happy",  M_HAPPY },
     { "mellow", M_MELLOW },
     { "love",   M_LOVE },
+    { "party",  M_PARTY },
 };
 static const uint8_t SHOW_COUNT = sizeof(SHOWS) / sizeof(SHOWS[0]);
 
@@ -514,7 +538,7 @@ static bool playShow(Mode m, uint32_t startAt) {
     return true;
 }
 
-// A feeling recognised on this lamp. Published first and only
+// A feeling or party recognised on this lamp. Published first and only
 // played if it went out, so an offline lamp never shows a shared moment
 // alone; it sends its spark instead, like a tap.
 static void launchShow(Mode m) {
@@ -839,6 +863,13 @@ static float rand01(uint32_t a, uint32_t b) {
     return hashBits(a * 0x9E3779B9U + hashBits(b)) / 4294967296.0f;
 }
 
+// Which of n, from a rand01() value. In float, the very top hashes round up
+// to exactly 1.0, which would index one past the end.
+static uint8_t nth(float r, uint8_t n) {
+    uint8_t k = (uint8_t)(r * n);
+    return k < n ? k : n - 1;
+}
+
 // Now and then a pixel sparkles, rising and falling over `len` ms. Which
 // pixels and when follows from `seed` and the clock alone, so two lamps on
 // the same clock sparkle alike. `chance` is how often each pixel's turn,
@@ -861,6 +892,10 @@ static Px gradient(const Rgb* stops, uint8_t n, float h, float level) {
 
 static Px rainbow(float h, float level) {
     return gradient(PASTELS, PASTEL_COUNT, h, level);
+}
+
+static Px spectrum(float h, float level) {
+    return gradient(SPECTRUM, SPECTRUM_COUNT, h, level);
 }
 
 // The aurora at pixel i: curtains of colour drifting at different speeds.
@@ -1080,6 +1115,173 @@ static Px love(uint8_t i, uint32_t dt, uint32_t seed) {
     return mix(p, px(ROSE, MAX_LEVEL), 0.8f * sparkle(i, dt, 1100, 380, 0.25f, seed));
 }
 
+// --- Party: 6 taps, all ten effects in turn, in the full spectrum -----------
+// However wild, the whole ring changes brightness at most about twice a
+// second; only single LEDs and moving lights go faster. Each effect runs from
+// 0 to PARTY_MS, so none of them needs its phases wrapping.
+
+// Prism: the spectrum spins, speeding up from 0.3 to 3 turns a second and back.
+static Px prism(uint8_t i, uint32_t dt) {
+    float s = dt / 1000.0f, T = PARTY_MS / 1000.0f;
+    float turns = 0.3f * s + 1.35f * (s - T / TAU * sinf(TAU * s / T));
+    Px p = spectrum((float)i / NUM_PIXELS - turns, 0.6f);
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), 0.6f * glint(i, NUM_PIXELS * turns));
+}
+
+// Comets: four comets at their own speeds, overtaking each other.
+static Px comets(uint8_t i, uint32_t dt, uint32_t seed) {
+    Px p = { 0, 0, 0 };
+    uint8_t first = nth(rand01(0, seed + 2), SPECTRUM_COUNT);
+    for (uint8_t k = 0; k < 4; k++) {
+        float head = NUM_PIXELS * (rand01(k, seed + 1) + (float)dt / (700 + 1100 * rand01(k, seed)));
+        Rgb c = SPECTRUM[(first + 2 * k) % SPECTRUM_COUNT];
+        p = mix(p, px(c, MAX_LEVEL), trail(i, head, 4.0f));
+        p = mix(p, px(COOL_WHITE, MAX_LEVEL), 0.8f * glint(i, head));
+    }
+    return p;
+}
+
+// Confetti: single LEDs pop in random colours, more and more of them.
+static Px confetti(uint8_t i, uint32_t dt, uint32_t seed) {
+    float chance = 0.12f + 0.6f * smooth((float)dt / 7000);
+    uint32_t shifted = dt + (uint32_t)(rand01(i, seed) * CONFETTI_SLOT_MS);
+    uint32_t slot = shifted / CONFETTI_SLOT_MS, into = shifted % CONFETTI_SLOT_MS;
+    uint32_t roll = slot * 31 + i;
+    Px p = spectrum((float)i / NUM_PIXELS + (float)dt / 4000, 0.1f);
+    if (rand01(roll, seed + 1) >= chance) return p;
+    Rgb c = SPECTRUM[nth(rand01(roll, seed + 2), SPECTRUM_COUNT)];
+    return mix(p, px(c, MAX_LEVEL), smooth(into / 40.0f) * expf(-(float)into / 150));
+}
+
+// Fireworks: a white bang at a random spot, a shell of colour flying out both
+// ways, then crackle inside it as it falls.
+static Px fireworks(uint8_t i, uint32_t dt, uint32_t seed) {
+    Px p = { 0, 0, 0 };
+    for (uint8_t k = 0; k < 8; k++) {
+        float u = ((float)dt - 200 - k * 1150 - 400 * rand01(k, seed)) / 1500;
+        if (u <= 0 || u >= 1) continue;
+        float d = apart(i, rand01(k, seed + 1) * NUM_PIXELS);
+        Rgb c = SPECTRUM[nth(rand01(k, seed + 2), SPECTRUM_COUNT)];
+        float r = 7 * (1 - (1 - u) * (1 - u));       // flies out fast, then slows
+        float inside = smooth(r - d);
+        p = mix(p, px(c, MAX_LEVEL), min(1.0f, bump(d - r, 1.8f) * (1 - u) + 0.5f * inside * (1 - u) * (1 - u)));
+        p = mix(p, px(COOL_WHITE, MAX_LEVEL),
+                0.9f * inside * smooth((u - 0.35f) / 0.2f) * (1 - u) * sparkle(i, dt, 160, 70, 0.45f, seed + 3 + k));
+        p = mix(p, px(COOL_WHITE, MAX_LEVEL), (1 - smooth(u * 6)) * bump(d, 2.5f));   // the bang
+    }
+    return p;
+}
+
+// Plasma: three waves of colour flowing through each other, faster and faster.
+static Px plasma(uint8_t i, uint32_t dt) {
+    float at = (float)i / NUM_PIXELS, s = dt / 1000.0f;
+    float go = s + 0.08f * s * s;
+    float a = sinf(TAU * (at + go / 3));
+    float b = sinf(TAU * (2 * at - go / 2.3f) + 1.1f);
+    float c = sinf(TAU * (3 * at + go / 1.7f) + 2.3f);
+    return spectrum(0.5f * a + 0.3f * b + go / 8, 0.35f + 0.15f * (c + 1));
+}
+
+// Ping-pong: two lights run out from pixel 0, meet on the far side, run back
+// and meet again, a new colour and a little quicker each time, with a flash
+// where they meet.
+static Px pingPong(uint8_t i, uint32_t dt, uint32_t seed) {
+    float s = dt / 1000.0f, ph = 1.1f * s + 0.07f * s * s;   // bounces so far
+    uint32_t n = (uint32_t)ph;
+    float f = ph - n;
+    float x = (NUM_PIXELS / 2) * (n % 2 == 0 ? f : 1 - f);
+    Rgb c = SPECTRUM[(n * 3 + seed % SPECTRUM_COUNT) % SPECTRUM_COUNT];
+    float d = fromStart(i);
+    Px p = mix(px(c, 0.12f), px(c, MAX_LEVEL), min(1.0f, bump(d - x, 2.0f) + 0.35f * bump(d - x, 5.0f)));
+    float met = n % 2 == 0 ? 0 : NUM_PIXELS / 2;            // where the two last met
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), (1 - smooth(f * 5)) * bump(d - met, 2.5f));
+}
+
+// Raindrops: drops land on single LEDs and ripple out both ways, closer and
+// closer together.
+static Px raindrops(uint8_t i, uint32_t dt, uint32_t seed) {
+    Px p = spectrum((float)i / NUM_PIXELS + (float)dt / 6000, 0.1f);
+    for (uint8_t k = 0; k < 20; k++) {
+        float at = 9000 * powf(k / 20.0f, 0.65f) + 250 * rand01(k, seed);
+        float u = ((float)dt - at) / 1200;
+        if (u <= 0 || u >= 1) continue;
+        float d = apart(i, floorf(rand01(k, seed + 1) * NUM_PIXELS));
+        Rgb c = SPECTRUM[nth(rand01(k, seed + 2), SPECTRUM_COUNT)];
+        p = mix(p, px(c, MAX_LEVEL), bump(d - 6 * u, 1.5f) * (1 - u));
+        p = mix(p, px(COOL_WHITE, MAX_LEVEL), (1 - smooth(u * 4)) * bump(d, 1.2f));   // the splash
+    }
+    return p;
+}
+
+// Bass line: 128 bpm. Each kick ripples out from pixel 0 and every LED jumps
+// to its own height, the colours stepping round each beat, with hi-hats
+// ticking on single LEDs.
+static Px bassline(uint8_t i, uint32_t t, uint32_t seed) {
+    uint32_t beat = t / BASS_BEAT_MS;
+    float into = (float)(t % BASS_BEAT_MS) - fromStart(i) * 10;
+    float kick = smooth(into / 25) * expf(-max(0.0f, into) / 170);
+    float height = 0.3f + 0.7f * rand01(beat * 31 + i, seed);
+    Px p = spectrum((float)i / NUM_PIXELS + (float)beat / 8, 0.12f + 0.58f * kick * height);
+    float hat = sparkle(i, t + BASS_BEAT_MS / 2, BASS_BEAT_MS, 90, 0.25f, seed + 1);
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), 0.85f * hat);
+}
+
+// Colour wipes: each colour floods round over the last behind a white edge,
+// quicker each time, every other one going the other way.
+static Px wipes(uint8_t i, uint32_t dt) {
+    float s = dt / 1000.0f, ph = 0.9f * s + 0.06f * s * s;   // wipes so far
+    uint32_t n = (uint32_t)ph;
+    float f = ph - n;
+    float front = (NUM_PIXELS + 3) * f;                       // runs past the end, so it closes softly
+    float at = n % 2 == 0 ? i : NUM_PIXELS - 1 - i;
+    Px now = px(SPECTRUM[(n * 3) % SPECTRUM_COUNT], 0.6f);
+    Px was = n > 0 ? px(SPECTRUM[(n * 3 + 5) % SPECTRUM_COUNT], 0.6f) : Px{ 0, 0, 0 };
+    Px p = mix(was, now, smooth((front - at) / 1.5f));
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), bump(at - front, 1.5f));
+}
+
+// Marquee: eight lights, one in each spectrum colour, marching round,
+// speeding up from 0.4 to 2.8 laps a second.
+static Px marquee(uint8_t i, uint32_t dt) {
+    float s = dt / 1000.0f, laps = 0.4f * s + 0.12f * s * s;
+    Px p = { 0, 0, 0 };
+    for (uint8_t k = 0; k < 8; k++)
+        p = mix(p, px(SPECTRUM[k], MAX_LEVEL), bump(apart(i, NUM_PIXELS * (k / 8.0f + laps)), 1.5f));
+    return p;
+}
+
+// Effect e of the ten, `t` ms into its 10 s run.
+static Px partyEffect(uint8_t e, uint8_t i, uint32_t t, uint32_t seed) {
+    switch (e) {
+    case 0:  return prism(i, t);
+    case 1:  return comets(i, t, seed);
+    case 2:  return confetti(i, t, seed);
+    case 3:  return fireworks(i, t, seed);
+    case 4:  return plasma(i, t);
+    case 5:  return pingPong(i, t, seed);
+    case 6:  return raindrops(i, t, seed);
+    case 7:  return bassline(i, t, seed);
+    case 8:  return wipes(i, t);
+    default: return marquee(i, t);
+    }
+}
+
+// Which effect plays k-th. The order comes from the seed, so both lamps play
+// the same one; stepping 3 or 7 round ten visits every effect before any
+// repeats, and never plays one twice in a row.
+static uint8_t partyPick(uint32_t k, uint32_t seed) {
+    return (seed % 10 + k * (((seed >> 4) & 1) ? 3 : 7)) % 10;
+}
+
+// The party: all ten in turn, 10 s each, each fading into the next.
+static Px party(uint8_t i, uint32_t dt, uint32_t seed) {
+    uint32_t k = dt / PARTY_MS, t = dt % PARTY_MS;
+    Px p = partyEffect(partyPick(k, seed), i, t, seed + k);
+    if (k == 0 || t >= PARTY_FADE_MS) return p;
+    Px was = partyEffect(partyPick(k - 1, seed), i, t + PARTY_MS, seed + k - 1);
+    return mix(was, p, smooth((float)t / PARTY_FADE_MS));
+}
+
 // --- Lamp light: a double tap with nothing waiting --------------------------
 // An aura of soft cool pastels drifting slowly round: two bands of brightness
 // travelling opposite ways at different speeds, so it never sits still and
@@ -1165,6 +1367,7 @@ static Px targetFor(uint8_t i, uint32_t dt) {
     case M_HAPPY:     return happy(i, dt, showSeed);
     case M_MELLOW:    return mellow(i, dt, showSeed);
     case M_LOVE:      return love(i, dt, showSeed);
+    case M_PARTY:     return party(i, dt, showSeed);
     case M_LAMP_ON:   return lampIgnite(i, dt);
     case M_LAMP:      return lampGlow(i);
     case M_LAMP_OFF:  return lampCollapse(i, dt);
@@ -1248,10 +1451,11 @@ static void dispatchTaps(uint8_t n) {
         Serial.printf("[tap] %u taps ignored\n", n);
         return;
     }
-    Serial.printf("[tap] %u taps -> %s\n", n, n == 3 ? "happy" : n == 4 ? "mellow" : "love");
+    Serial.printf("[tap] %u taps -> %s\n", n, n == 3 ? "happy" : n == 4 ? "mellow" : n == 5 ? "love" : "party");
     if (n == 3)      launchShow(M_HAPPY);
     else if (n == 4) launchShow(M_MELLOW);
-    else             launchShow(M_LOVE);
+    else if (n == 5) launchShow(M_LOVE);
+    else             launchShow(M_PARTY);
 }
 
 static void serviceTouch() {
@@ -1372,7 +1576,7 @@ static void serviceSerial() {
     } else if (line.startsWith("SHOW ")) {  // = any show, as if recognised here
         const Show* s = showNamed(line.substring(5).c_str());
         if (s) launchShow(s->mode);
-        else Serial.println("[show] no such show: happy, mellow or love");
+        else Serial.println("[show] no such show: happy, mellow, love or party");
     } else if (line == "STATUS") {
         Serial.printf("id=%s mode=%s wifi=%d mqtt=%d rssi=%d synced=%d\n",
                       DEVICE_ID, modeName(mode), WiFi.status() == WL_CONNECTED,
