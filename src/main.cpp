@@ -30,7 +30,10 @@
  *    Nothing on the signal topic is retained: these are moments, not state.
  *    A lamp that was unplugged simply misses them and boots dark.
  *
- *    Every message has a unique id: device, a per-boot random nonce, a counter.
+ *    Every message has a unique id (device, a per-boot random nonce, a counter)
+ *    and the receiver drops ids it has already seen, so a redelivery can't
+ *    restart an animation. An id that doesn't start with the other lamp's
+ *    DEVICE_ID isn't hers and is ignored.
  *
  *  WIFI
  *    If the saved network can't be joined at power-up, the lamp opens the
@@ -166,6 +169,9 @@ static uint32_t touchChangedAt = 0;
 // Message ids.
 static uint32_t bootNonce = 0;
 static uint32_t eventSeq  = 0;
+static String   seenIds[16];
+static uint8_t  seenNext  = 0;
+static String   peerPrefix;             // "B-" on lamp A: her ids start with it
 
 // Connectivity.
 static uint32_t wifiDownSince = 0;
@@ -195,6 +201,15 @@ static String newEventId() {
     snprintf(buf, sizeof(buf), "%s-%08lx-%lu", DEVICE_ID,
              (unsigned long)bootNonce, (unsigned long)++eventSeq);
     return String(buf);
+}
+
+// True if this id arrived before. Remembers the last 16.
+static bool alreadySeen(const char* id) {
+    if (!id || !*id) return false;
+    for (uint8_t i = 0; i < 16; i++) if (seenIds[i] == id) return true;
+    seenIds[seenNext] = id;
+    seenNext = (seenNext + 1) % 16;
+    return false;
 }
 
 // Gamma and MAX_BRIGHTNESS in one step, rounded once. gamma8() followed by
@@ -286,6 +301,13 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
         return;
     }
     const char* type = doc["type"] | "";
+    const char* id   = doc["id"]   | "";
+    // Only the paired lamp publishes here, and its ids start with its DEVICE_ID.
+    if (strncmp(id, peerPrefix.c_str(), peerPrefix.length())) {
+        Serial.println("[mqtt] rx id not from the paired lamp, ignoring");
+        return;
+    }
+    if (alreadySeen(id)) return;    // redelivered: never retrigger
 
     if (!strcmp(type, "TAP")) {
         Serial.println("[mqtt] rx TAP");
@@ -618,6 +640,7 @@ void setup() {
     bootNonce = esp_random();
 
     String peer = (strcmp(DEVICE_ID, "A") == 0) ? "B" : "A";
+    peerPrefix = peer + "-";
     topicSignalSelf = String("lamp/") + PAIR_ID + "/" + DEVICE_ID + "/signal";
     topicSignalPeer = String("lamp/") + PAIR_ID + "/" + peer + "/signal";
     topicStatusSelf = String("lamp/") + PAIR_ID + "/" + DEVICE_ID + "/status";
