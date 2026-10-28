@@ -21,8 +21,13 @@
  *                   answers it: bright aurora floods both lamps, then dims
  *                   down to dark. This is the only confirmation that a tap
  *                   reached her.
+ *    Hold           "I'm here with you". On her lamp a white light glides
+ *                   round the ring trailing aurora and stardust for as long
+ *                   as you hold, then fades out over 3 s when you let go.
+ *                   Yours glows softly to show the hold is live.
  *
  *  PRIORITY — one mode drives the LEDs at a time
+ *      2 live hold (hers or yours)
  *      3 the answer      4 her tap waiting
  *      6 your tap waiting, idle (and fades): anything may
  *        interrupt these
@@ -38,6 +43,8 @@
  *
  *    {"type":"TAP","id":"A-1a2b3c4d-7"}
  *    {"type":"ACK","id":"B-9f8e7d6c-3","of":"A-1a2b3c4d-7"}
+ *    {"type":"HOLD_START","id":"A-1a2b3c4d-8","hold":"A-1a2b3c4d-8"}
+ *    {"type":"HOLD_END","id":"A-1a2b3c4d-12","hold":"A-1a2b3c4d-8"}
  *
  *    Nothing on the signal topic is retained: these are moments, not state.
  *    A lamp that was unplugged simply misses them and boots dark.
@@ -46,6 +53,13 @@
  *    and the receiver drops ids it has already seen, so a redelivery can't
  *    restart an animation. An id that doesn't start with the other lamp's
  *    DEVICE_ID isn't hers and is ignored.
+ *
+ *    A hold repeats HOLD_START every second with the same "hold" id. The
+ *    receiver only starts the glow for a hold id it isn't already showing, so
+ *    the repeats just keep it alive. If they stop for HOLD_TIMEOUT_MS — her
+ *    power cut, her WiFi, a lost HOLD_END — the receiver ends the hold itself.
+ *    It also ends it at once if the broker says her lamp went offline or this
+ *    lamp loses its own connection.
  *
  *  WIFI
  *    If the saved network can't be joined at power-up, the lamp opens the
@@ -121,6 +135,9 @@ static const float LED_GAMMA = 2.6f;
 // Gesture recognition. Settable in config.h; see
 // config.example.h for how to choose them. Defaults here keep an older
 // config.h compiling.
+#ifndef HOLD_THRESHOLD_MS
+#define HOLD_THRESHOLD_MS 250
+#endif
 #ifndef TAP_WAIT_MS
 #define TAP_WAIT_MS 120000
 #endif
@@ -138,7 +155,12 @@ static const uint32_t ACCEPT_SWEEP_MS      = 800;    // the answer floods round 
 static const uint32_t ACCEPT_MS            = 3400;   //   then glows, dimming, until the fade
 static const uint32_t FADE_OUT_MS          = 3000;   // every fade to dark
 static const uint32_t TAP_FLASH_MS         = 900;    // your tap's spark, once round
-static const uint32_t TRANSITION_MS        = 300;    // blend into a new mode
+static const uint32_t TRANSITION_MS        = 300;    // blend into a hold
+static const float    HOLD_TX_LEVEL        = 0.3f;   // your own lamp while you hold
+static const uint32_t CURRENT_LAP_MS       = 3000;   // her hold's light, once round
+
+static const uint32_t HOLD_HEARTBEAT_MS    = 1000;   // HOLD_START repeat while holding
+static const uint32_t HOLD_TIMEOUT_MS      = 3000;   // no repeat for this long = hold over
 
 static const uint32_t FRAME_MS             = 16;     // ~60fps render tick
 
@@ -153,11 +175,15 @@ enum Mode : uint8_t {
     M_WAITING,    // her tap: a bloom sinking to a shimmer with fireflies, until answered or TAP_WAIT_MS
     M_SENT,       // your tap: one firefly circling while you wait for her answer
     M_ACCEPT,     // a tap answered: aurora floods both lamps, then dims
+    M_HOLD_TX,    // you're holding: a soft glow
+    M_HOLD_RX,    // she's holding: a light gliding round
     M_FADE,       // fading to dark; anything may interrupt
 };
 
 static uint8_t priorityOf(Mode m) {
     switch (m) {
+        case M_HOLD_RX:
+        case M_HOLD_TX: return 2;
         case M_ACCEPT:  return 3;
         case M_WAITING: return 4;
         default:        return 6;     // your tap waiting, idle, fades
@@ -168,6 +194,7 @@ static const char* modeName(Mode m) {
     switch (m) {
         case M_IDLE: return "idle";        case M_WAITING: return "waiting";
         case M_SENT: return "sent";        case M_ACCEPT: return "answered";
+        case M_HOLD_TX: return "holding";  case M_HOLD_RX: return "her-hold";
         default: return "fade";
     }
 }
@@ -190,9 +217,19 @@ static String   lastRxTapId;            // the tap an answer acknowledges
 static uint32_t messageSeed    = 0;     // where her tap's fireflies start and its twinkles fall
 static uint32_t tapFlashAt     = 0;     // local "tap registered" spark
 
+// Your hold.
+static bool     holdActive = false;     // past the threshold (finger or serial HOLD)
+static String   localHoldId;
+static uint32_t lastHeartbeatAt = 0;
+
+// Her hold. Read through peerHoldAlive(), never the flag alone.
+static bool     peerHold = false;
+static String   peerHoldId;
+static uint32_t peerHoldSeenAt = 0;
+
 // Touch.
 static bool     touchRaw = false, touchStable = false, touchHeld = false;
-static uint32_t touchChangedAt = 0;
+static uint32_t touchChangedAt = 0, pressStartedAt = 0;
 
 // Message ids.
 static uint32_t bootNonce = 0;
@@ -227,6 +264,11 @@ static void setMode(Mode m) {
 
 static bool messageShowing() {
     return mode == M_WAITING || (mode == M_FADE && fadingMessage);
+}
+
+// Her hold counts only while its repeats keep arriving and we can hear them.
+static bool peerHoldAlive() {
+    return peerHold && mqtt.connected() && millis() - peerHoldSeenAt < HOLD_TIMEOUT_MS;
 }
 
 static String newEventId() {
@@ -287,11 +329,19 @@ static bool publish(JsonDocument& doc, bool log = true) {
     return ok;
 }
 
+// HOLD_START (first and every repeat) or HOLD_END for our hold.
+static bool publishHold(const char* type, bool log = true) {
+    JsonDocument doc;
+    doc["type"] = type;
+    doc["hold"] = localHoldId;
+    return publish(doc, log);
+}
+
 // ============================================================================
 //  INTERACTIONS
 // ============================================================================
 
-// Her tap. Lower priority than an answer, and not queued.
+// Her tap. Lower priority than any hold or answer, and not queued.
 static void receiveTap(const char* id) {
     if (priorityOf(mode) < priorityOf(M_WAITING)) {
         Serial.printf("[lamp] tap ignored: %s showing\n", modeName(mode));
@@ -347,6 +397,47 @@ static void sendAck() {
     startAccept();
 }
 
+static void startLocalHold() {
+    holdActive = true;
+    localHoldId = newEventId();
+    Serial.println("[tap] hold -> HOLD_START");
+    publishHold("HOLD_START");
+    lastHeartbeatAt = millis();
+}
+
+static void endLocalHold() {
+    Serial.println("[tap] release -> HOLD_END");
+    publishHold("HOLD_END");
+    holdActive = false;
+}
+
+// Holds outrank everything else, so they're decided every loop from the two
+// facts both lamps can see: my finger, her hold.
+static void updateHolds() {
+    bool mine = holdActive;
+    bool hers = peerHoldAlive();
+
+    if (peerHold && !hers) {
+        Serial.println("[lamp] peer hold ended (released, timed out or offline)");
+        peerHold = false;
+    }
+
+    if (mode == M_HOLD_RX && !hers) { setMode(M_FADE); return; }
+    if (mode == M_HOLD_TX && !mine) { setMode(M_FADE); return; }
+
+    if (hers && mode != M_HOLD_RX && priorityOf(mode) > 2) setMode(M_HOLD_RX);
+    else if (mine && mode != M_HOLD_TX && priorityOf(mode) > 2) setMode(M_HOLD_TX);
+}
+
+// While holding, repeat HOLD_START so her lamp knows the hold is still live.
+static void serviceHoldHeartbeat() {
+    if (!holdActive) return;
+    uint32_t now = millis();
+    if (now - lastHeartbeatAt < HOLD_HEARTBEAT_MS) return;
+    lastHeartbeatAt = now;
+    publishHold("HOLD_START", false);
+}
+
 // ============================================================================
 //  INBOUND
 // ============================================================================
@@ -355,6 +446,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
     if (topicStatusPeer == topic) {
         bool online = (len == 6 && !memcmp(payload, "online", 6));
         Serial.printf("[mqtt] peer %s\n", online ? "online" : "offline");
+        if (!online) peerHold = false;
         return;
     }
     if (len == 0) return;       // a retained message being cleared
@@ -379,6 +471,16 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
     } else if (!strcmp(type, "ACK")) {
         Serial.println("[mqtt] rx ACK");
         receiveAck();
+    } else if (!strcmp(type, "HOLD_START")) {
+        const char* hold = doc["hold"] | "";
+        if (!peerHold || peerHoldId != hold) Serial.println("[mqtt] rx HOLD_START");
+        peerHold = true;
+        peerHoldId = hold;
+        peerHoldSeenAt = millis();
+    } else if (!strcmp(type, "HOLD_END")) {
+        const char* hold = doc["hold"] | "";
+        Serial.println("[mqtt] rx HOLD_END");
+        if (peerHoldId == hold) peerHold = false;
     }
     // Anything else (including the old firmware's messages) is ignored.
 }
@@ -393,6 +495,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
 static const float TAU             = 6.28318531f;  // one full turn, in radians
 static const float HEAD_PX         = 2.0f;   // a moving light's half-width; under ~1.5
                                              // it visibly hops from LED to LED
+static const float CURRENT_TAIL_PX = 4.0f;   // her hold's trail
 static const uint32_t ACCEPT_SEED  = 21;         // the answer's glints: the same on both
 
 static float smooth(float t) {
@@ -593,6 +696,24 @@ static Px accepted(uint8_t i, uint32_t dt) {
     return mix(p, px(COOL_WHITE, MAX_LEVEL), acceptEdge(i, dt));
 }
 
+// --- Her hold: the living current -------------------------------------------
+// A white light gliding round over a faint aurora, trailing the aurora's
+// colours and the odd sparkle of stardust in its wake.
+static Px livingCurrent(uint8_t i, uint32_t dt) {
+    float head = NUM_PIXELS * (float)(dt % CURRENT_LAP_MS) / CURRENT_LAP_MS;
+    Px p = auroraAt(i, dt, 0.2f);
+    p = mix(p, gradient(AURORA, AURORA_COUNT, (float)dt / 9000 + behind(i, head) / NUM_PIXELS, MAX_LEVEL),
+            trail(i, head, CURRENT_TAIL_PX));
+    float dust = sparkle(i, dt, 900, 450, 0.4f, 7) * smooth(1 - behind(i, head) / 10);
+    p = mix(p, px(COOL_WHITE, MAX_LEVEL), 0.55f * dust);
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), glint(i, head));
+}
+
+// Your own lamp while you hold: a soft glow, so you know the hold is live.
+static Px holdingGlow(uint8_t i, uint32_t dt) {
+    return auroraAt(i, dt, HOLD_TX_LEVEL);
+}
+
 // End timed modes before drawing.
 static void updateTimers(uint32_t now) {
     uint32_t dt = now - modeStartedAt;
@@ -613,6 +734,8 @@ static Px targetFor(uint8_t i, uint32_t dt) {
     case M_WAITING:   return waiting(i, dt, messageSeed, waitingRest(i, dt));
     case M_SENT:      return sentGlow(i, dt, Px{ 0, 0, 0 });
     case M_ACCEPT:    return accepted(i, dt);
+    case M_HOLD_TX:   return holdingGlow(i, dt);
+    case M_HOLD_RX:   return livingCurrent(i, dt);
     default:          return { 0, 0, 0 };       // M_IDLE, and what M_FADE fades to
     }
 }
@@ -667,9 +790,15 @@ static void serviceTouch() {
 
     if (touchStable && !touchHeld) {                    // press
         touchHeld = true;
+        pressStartedAt = now;
+    } else if (touchStable && touchHeld) {              // holding
+        if (!holdActive && now - pressStartedAt >= HOLD_THRESHOLD_MS) {
+            startLocalHold();
+        }
     } else if (!touchStable && touchHeld) {             // release
         touchHeld = false;
-        tapped();
+        if (holdActive) endLocalHold();
+        else tapped();
     }
 }
 
@@ -715,6 +844,7 @@ static void serviceMqtt() {
         mqtt.publish(topicSignalSelf.c_str(), (const uint8_t*)"", 0, true);
         mqtt.subscribe(topicSignalPeer.c_str(), 1);
         mqtt.subscribe(topicStatusPeer.c_str(), 1);
+        lastHeartbeatAt = 0;    // still holding? tell her straight away
     } else {
         // rc=-2 is almost always the root CA. rc=4/5 is bad credentials.
         Serial.printf("failed, rc=%d\n", mqtt.state());
@@ -731,11 +861,16 @@ static void serviceSerial() {
         wm.resetSettings(); delay(200); ESP.restart();
     } else if (line == "PING") {            // = a tap
         tapped();
+    } else if (line == "HOLD") {            // = finger down
+        if (!holdActive) startLocalHold();
+    } else if (line == "RELEASE") {         // = finger up
+        if (holdActive && !touchHeld) endLocalHold();
     } else if (line == "STATUS") {
         Serial.printf("id=%s mode=%s wifi=%d mqtt=%d rssi=%d\n",
                       DEVICE_ID, modeName(mode), WiFi.status() == WL_CONNECTED,
                       mqtt.connected(), WiFi.RSSI());
-        Serial.printf("   messageShowing=%d\n", messageShowing());
+        Serial.printf("   holding=%d peerHold=%d messageShowing=%d\n",
+                      holdActive, peerHoldAlive(), messageShowing());
     }
 }
 
@@ -792,6 +927,8 @@ void loop() {
     serviceMqtt();
     serviceTouch();
     serviceSerial();
+    serviceHoldHeartbeat();
+    updateHolds();
 
     uint32_t now = millis();
     if (now - lastFrameAt >= FRAME_MS) {

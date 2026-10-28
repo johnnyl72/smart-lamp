@@ -61,6 +61,13 @@
 // GESTURES
 // ---------------------------------------------------------------------------
 
+// How long a touch must last to count as a hold rather than a tap, in ms.
+// 250 makes a hold start almost as soon as the finger settles. Most taps
+// last 50-200 ms, but a slow, deliberate tap can run longer: if taps keep
+// turning into holds, raise it towards 400. Don't go below 250, or ordinary
+// taps start counting as holds.
+#define HOLD_THRESHOLD_MS 250
+
 // How long her tap waits on your lamp for you to tap back, in ms, and how
 // long your own lamp's firefly circles waiting for hers. Long enough that
 // she can walk into the room and still see it; much past a few minutes and
