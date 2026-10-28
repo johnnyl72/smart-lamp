@@ -8,6 +8,19 @@ src/config.h
 .vscode/
 !.vscode/extensions.json
 
+# Linked Lamp's own 3D file (GPL-3.0). Keep it out of git — download it fresh
+# from upstream into this folder instead of vendoring.
+3d-design/linked-lamp-original/
+# Everything 3d-design/make_lamp.py generates; rebuild it instead.
+3d-prints/
+__pycache__/
+*.stl
+*.3mf
+*.gcode
+
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Bambu Studio CLI slicing report
+result.json

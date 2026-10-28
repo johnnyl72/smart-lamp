@@ -1,0 +1,41 @@
+How to change the lamp, for example for a different LED ring
+
+1. Measure the ring's outside diameter across its edge. Measure a few times
+   and note the smallest and largest readings.
+2. Open settings.py in this folder (VS Code is fine). Change RING_OD_MIN and
+   RING_OD_MAX to your readings, and RING_LEDS and RING_ID if those changed
+   too. Save.
+3. Paste this into Terminal and press Return:
+
+     cd ~/Projects/lamp_proj
+     uv run --no-project --python 3.12 --with cadquery python 3d-design/make_lamp.py
+
+   It takes about 30 seconds and rebuilds everything in 3d-prints: the print
+   files, the pictures, the listing text and READ ME FIRST.txt.
+4. Print the new fit test before anything else.
+5. Upload the new files to MakerWorld and redo the three print profiles.
+   In the Diffuser profile, set Quality -> Wall generator to Arachne, or
+   only its top plate prints (its walls are one 0.4 mm line).
+6. If the LED count changed, also change RING_PIXELS in src/config.h and keep
+   RING_PIXELS x MAX_BRIGHTNESS at or below 2880 (24 LEDs: 120), then reflash
+   both boards.
+
+The whole lamp grows or shrinks with the ring, so the ring always sits in the
+same proportions. The parts that fit real components (ESP32 posts and USB-C
+slot, touch sensor slot) never change size. Neither do the base's rim and the
+diffuser's wall, so a new diffuser always fits a base already printed at the
+same ring size.
+
+To change the text on top: open settings.py, change TOP_TEXT (and
+TOP_TEXT_WIDTH if the word is much longer or shorter), save, and do steps 3
+and 5 above. Only the diffuser changes, so only it needs reprinting.
+
+What's in this folder
+    settings.py            the values you change
+    make_lamp.py           builds the lamp: every part's shape and measurements
+    screen_holder.py       the optional screen window (MAKE_SCREEN_VERSION in settings.py)
+    top_text.py            the text and hearts engraved on the top (TOP_TEXT in settings.py)
+    fonts/                 Pacifico, the script font, and its open font license
+    make_pictures.py       the listing pictures
+    paths.py               folder and file names in 3d-prints
+    linked-lamp-original/  Linked Lamp's diffuser; its logo is used if TOP_TEXT is empty
