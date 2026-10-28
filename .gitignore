@@ -1,0 +1,13 @@
+# Holds your HiveMQ password and the pairing ID. Never commit this.
+src/config.h
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+!.vscode/extensions.json
+
+# OS noise
+.DS_Store
+Thumbs.db
