@@ -61,8 +61,10 @@
 // GESTURES
 // ---------------------------------------------------------------------------
 
-// How long her tap glows on your lamp before it fades, in ms. Long enough
-// that she can walk into the room and still see it.
+// How long her tap waits on your lamp for you to tap back, in ms, and how
+// long your own lamp's firefly circles waiting for hers. Long enough that
+// she can walk into the room and still see it; much past a few minutes and
+// an answer stops feeling like a reply. Set it the same on both lamps.
 #define TAP_WAIT_MS 120000
 
 // ---------------------------------------------------------------------------

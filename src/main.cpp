@@ -12,20 +12,32 @@
  *    Tap            "I miss you". On her lamp aurora light blooms both ways
  *                   round the ring from one spot, then sinks to a low shimmer
  *                   with three fireflies circling at their own speeds. It
- *                   glows for TAP_WAIT_MS, then fades out. On yours a spark
- *                   runs once round to show the tap registered, not that it
- *                   arrived. Another tap blooms again and restarts the wait;
- *                   animations never stack.
+ *                   waits TAP_WAIT_MS for her to tap back, then fades out. On
+ *                   yours a spark runs once round to show the tap registered,
+ *                   then one dim firefly circles while you wait. Neither says
+ *                   the tap arrived. Another tap blooms again and restarts
+ *                   both waits; animations never stack.
+ *    Tap back       "Miss you too". A tap while her tap is waiting or fading
+ *                   answers it: bright aurora floods both lamps, then dims
+ *                   down to dark. This is the only confirmation that a tap
+ *                   reached her.
  *
- *  MODES — one mode drives the LEDs at a time
- *    Every change of mode blends from what's actually on the ring, so
- *    transitions are smooth.
+ *  PRIORITY — one mode drives the LEDs at a time
+ *      3 the answer      4 her tap waiting
+ *      6 your tap waiting, idle (and fades): anything may
+ *        interrupt these
+ *    A lower-priority event never interrupts a higher one and is not queued.
+ *    A higher one replaces a lower one outright, and so does a newer one on
+ *    the same level: whatever it replaced is dropped, never resumed. Every
+ *    change of mode blends from what's actually on the ring, so transitions
+ *    are smooth.
  *
  *  PROTOCOL
  *    lamp/<PAIR_ID>/<ID>/signal    this lamp publishes, the other subscribes
  *    lamp/<PAIR_ID>/<ID>/status    "online" / "offline" (last will), retained
  *
  *    {"type":"TAP","id":"A-1a2b3c4d-7"}
+ *    {"type":"ACK","id":"B-9f8e7d6c-3","of":"A-1a2b3c4d-7"}
  *
  *    Nothing on the signal topic is retained: these are moments, not state.
  *    A lamp that was unplugged simply misses them and boots dark.
@@ -121,6 +133,9 @@ static const uint32_t BLOOM_MS             = BLOOM_GATHER_MS + BLOOM_SPREAD_MS;
 static const uint32_t SETTLE_MS            = 1800;   //   and its glow sinks to the waiting shimmer
 static const uint32_t WAIT_BREATHE_MS      = 6000;   // the shimmer, one slow breath
 static const uint32_t FLY_LAPS[]           = { 4200, 6100, 8700 };  // her tap's fireflies, once round each
+static const uint32_t SENT_LAP_MS          = 6000;   // your own waiting firefly, once round
+static const uint32_t ACCEPT_SWEEP_MS      = 800;    // the answer floods round in this,
+static const uint32_t ACCEPT_MS            = 3400;   //   then glows, dimming, until the fade
 static const uint32_t FADE_OUT_MS          = 3000;   // every fade to dark
 static const uint32_t TAP_FLASH_MS         = 900;    // your tap's spark, once round
 static const uint32_t TRANSITION_MS        = 300;    // blend into a new mode
@@ -135,13 +150,24 @@ static const uint32_t MQTT_RETRY_MS        = 5000;
 
 enum Mode : uint8_t {
     M_IDLE,       // dark
-    M_WAITING,    // her tap: a bloom sinking to a shimmer with fireflies, for TAP_WAIT_MS
+    M_WAITING,    // her tap: a bloom sinking to a shimmer with fireflies, until answered or TAP_WAIT_MS
+    M_SENT,       // your tap: one firefly circling while you wait for her answer
+    M_ACCEPT,     // a tap answered: aurora floods both lamps, then dims
     M_FADE,       // fading to dark; anything may interrupt
 };
+
+static uint8_t priorityOf(Mode m) {
+    switch (m) {
+        case M_ACCEPT:  return 3;
+        case M_WAITING: return 4;
+        default:        return 6;     // your tap waiting, idle, fades
+    }
+}
 
 static const char* modeName(Mode m) {
     switch (m) {
         case M_IDLE: return "idle";        case M_WAITING: return "waiting";
+        case M_SENT: return "sent";        case M_ACCEPT: return "answered";
         default: return "fade";
     }
 }
@@ -159,6 +185,8 @@ static Px       shown[NUM_PIXELS];      // what's on the ring right now
 static Px       from[NUM_PIXELS];       // what was on it when the mode changed
 
 static uint32_t messageLitAt   = 0;     // last tap from her: TAP_WAIT_MS counts from here
+static bool     fadingMessage  = false; // M_FADE is the end of her tap (a tap back still answers)
+static String   lastRxTapId;            // the tap an answer acknowledges
 static uint32_t messageSeed    = 0;     // where her tap's fireflies start and its twinkles fall
 static uint32_t tapFlashAt     = 0;     // local "tap registered" spark
 
@@ -194,6 +222,11 @@ static void setMode(Mode m) {
     mode = m;
     modeStartedAt = millis();
     memcpy(from, shown, sizeof(shown));
+    fadingMessage = false;
+}
+
+static bool messageShowing() {
+    return mode == M_WAITING || (mode == M_FADE && fadingMessage);
 }
 
 static String newEventId() {
@@ -258,9 +291,14 @@ static bool publish(JsonDocument& doc, bool log = true) {
 //  INTERACTIONS
 // ============================================================================
 
-// Her tap.
-static void receiveTap() {
-    bool restart = mode == M_WAITING;
+// Her tap. Lower priority than an answer, and not queued.
+static void receiveTap(const char* id) {
+    if (priorityOf(mode) < priorityOf(M_WAITING)) {
+        Serial.printf("[lamp] tap ignored: %s showing\n", modeName(mode));
+        return;
+    }
+    lastRxTapId = id;
+    bool restart = messageShowing();
     messageLitAt = millis();
     // Blooms again over whatever is showing, and the wait restarts. Except
     // while the last bloom is still opening: restarting would freeze it
@@ -274,13 +312,39 @@ static void receiveTap() {
                   (unsigned long)(TAP_WAIT_MS / 1000), restart ? ", restarted" : "");
 }
 
+// The answer, on this lamp, unless something more important is showing.
+static void startAccept() {
+    if (priorityOf(mode) < priorityOf(M_ACCEPT) || mode == M_ACCEPT) {
+        Serial.printf("[lamp] answer ignored: %s showing\n", modeName(mode));
+        return;
+    }
+    Serial.println("[lamp] answered: flooding");
+    setMode(M_ACCEPT);
+}
+
+// Her tap back, answering ours.
+static void receiveAck() {
+    startAccept();
+}
+
 static void sendTap() {
     Serial.println("[tap] single -> TAP");
     JsonDocument doc;
     doc["type"] = "TAP";
     publish(doc);
-    // Sent or not: the spark means "registered", never "delivered".
+    // Sent or not: the spark means "registered" and the firefly "waiting",
+    // never "delivered". Only her answer says it arrived.
     tapFlashAt = millis();
+    if (priorityOf(mode) >= priorityOf(M_SENT)) setMode(M_SENT);
+}
+
+static void sendAck() {
+    Serial.println("[tap] answer -> ACK");
+    JsonDocument doc;
+    doc["type"] = "ACK";
+    doc["of"]   = lastRxTapId;
+    publish(doc);
+    startAccept();
 }
 
 // ============================================================================
@@ -311,7 +375,10 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
 
     if (!strcmp(type, "TAP")) {
         Serial.println("[mqtt] rx TAP");
-        receiveTap();
+        receiveTap(id);
+    } else if (!strcmp(type, "ACK")) {
+        Serial.println("[mqtt] rx ACK");
+        receiveAck();
     }
     // Anything else (including the old firmware's messages) is ignored.
 }
@@ -326,6 +393,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
 static const float TAU             = 6.28318531f;  // one full turn, in radians
 static const float HEAD_PX         = 2.0f;   // a moving light's half-width; under ~1.5
                                              // it visibly hops from LED to LED
+static const uint32_t ACCEPT_SEED  = 21;         // the answer's glints: the same on both
 
 static float smooth(float t) {
     if (t <= 0) return 0;
@@ -464,7 +532,7 @@ static Px bloomOver(Px base, uint8_t i, uint32_t dt) {
     return mix(base, highlight, bloomLight(i, dt));
 }
 
-// --- Her tap, glowing -------------------------------------------------------
+// --- Her tap, waiting for your answer ---------------------------------------
 // The bloom leaves bright aurora that sinks to a low shimmer, and three
 // fireflies circle at their own speeds, each breathing on its own beat, with
 // now and then a single LED twinkling white. `rest` is the shimmer it sinks
@@ -489,11 +557,52 @@ static Px waiting(uint8_t i, uint32_t dt, uint32_t seed, Px rest) {
     return bloomOver(p, i, dt);
 }
 
+// --- Your tap, waiting for hers ---------------------------------------------
+// One dim firefly circling, setting off as your spark finishes (540 ms in),
+// its colour drifting slowly through the aurora.
+static Px sentGlow(uint8_t i, uint32_t dt, Px rest) {
+    float head = NUM_PIXELS * (float)dt / SENT_LAP_MS;
+    float glow = 0.5f + 0.12f * sinf(TAU * (float)dt / 2400);
+    Px c = gradient(AURORA, AURORA_COUNT, (float)dt / 20000, glow);
+    float out = smooth(((float)dt - 540) / 600);
+    Px p = mix(rest, c, out * trail(i, head, 2.5f));
+    return mix(p, mix(c, px(COOL_WHITE, glow), 0.4f), out * glint(i, head));
+}
+
+// --- The answer: aurora floods both lamps -----------------------------------
+// Bright aurora floods both ways round from pixel 0 behind a white edge, runs
+// at three times the waiting pace with glints everywhere, then dims down
+// before the fade takes it the rest of the way.
+
+static float acceptFront(uint32_t dt) {
+    return (NUM_PIXELS / 2 + 2) * smooth((float)dt / ACCEPT_SWEEP_MS);
+}
+
+static float acceptReveal(uint8_t i, uint32_t dt) {   // 1 once the flood has passed pixel i
+    return smooth((acceptFront(dt) - fromStart(i)) / 2.0f);
+}
+
+static float acceptEdge(uint8_t i, uint32_t dt) {
+    return (1 - smooth((float)dt / ACCEPT_SWEEP_MS)) * bump(fromStart(i) - acceptFront(dt), 2.5f);
+}
+
+static Px accepted(uint8_t i, uint32_t dt) {
+    float level = MAX_LEVEL - 0.3f * smooth(((float)dt - 1500) / (ACCEPT_MS - 1500));
+    Px p = auroraAt(i, 3.0f * dt, level);
+    p = mix(p, px(COOL_WHITE, MAX_LEVEL), 0.8f * sparkle(i, dt, 700, 260, 0.35f, ACCEPT_SEED));
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), acceptEdge(i, dt));
+}
+
 // End timed modes before drawing.
 static void updateTimers(uint32_t now) {
     uint32_t dt = now - modeStartedAt;
     if (mode == M_WAITING && now - messageLitAt >= TAP_WAIT_MS) {
         setMode(M_FADE);
+        fadingMessage = true;   // a tap back during the fade still answers
+    } else if (mode == M_SENT && dt >= TAP_WAIT_MS) {
+        setMode(M_FADE);
+    } else if (mode == M_ACCEPT && dt >= ACCEPT_MS) {
+        setMode(M_FADE);        // the flood's last glow, out over 3 s
     } else if (mode == M_FADE && dt >= FADE_OUT_MS) {
         setMode(M_IDLE);
     }
@@ -502,17 +611,20 @@ static void updateTimers(uint32_t now) {
 static Px targetFor(uint8_t i, uint32_t dt) {
     switch (mode) {
     case M_WAITING:   return waiting(i, dt, messageSeed, waitingRest(i, dt));
+    case M_SENT:      return sentGlow(i, dt, Px{ 0, 0, 0 });
+    case M_ACCEPT:    return accepted(i, dt);
     default:          return { 0, 0, 0 };       // M_IDLE, and what M_FADE fades to
     }
 }
 
 // How far pixel i has blended from what was showing into the current mode.
-// Most modes take the whole ring at once. Her tap's bloom sweeps it in
-// behind its moving edge instead, so a tap during her glow blooms over it
-// rather than dimming it first.
+// Most modes take the whole ring at once. Her tap's bloom and the answer's
+// flood sweep it in behind their moving edge instead, so a tap during her
+// glow blooms over it rather than dimming it first.
 static float entryWeight(uint8_t i, uint32_t dt) {
     switch (mode) {
     case M_WAITING: return min(1.0f, bloomReveal(i, dt) + bloomLight(i, dt));
+    case M_ACCEPT:  return min(1.0f, acceptReveal(i, dt) + acceptEdge(i, dt));
     case M_FADE:    return smooth((float)dt / FADE_OUT_MS);
     default:        return smooth((float)dt / TRANSITION_MS);
     }
@@ -540,6 +652,12 @@ static void renderFrame() {
 //  TOUCH
 // ============================================================================
 
+// A tap answers her tap if one is showing; otherwise it goes to her.
+static void tapped() {
+    if (messageShowing()) sendAck();
+    else sendTap();
+}
+
 static void serviceTouch() {
     uint32_t now = millis();
     bool raw = digitalRead(PIN_TOUCH) == HIGH;
@@ -551,7 +669,7 @@ static void serviceTouch() {
         touchHeld = true;
     } else if (!touchStable && touchHeld) {             // release
         touchHeld = false;
-        sendTap();
+        tapped();
     }
 }
 
@@ -612,11 +730,12 @@ static void serviceSerial() {
     if (line == "RESET_WIFI") {
         wm.resetSettings(); delay(200); ESP.restart();
     } else if (line == "PING") {            // = a tap
-        sendTap();
+        tapped();
     } else if (line == "STATUS") {
         Serial.printf("id=%s mode=%s wifi=%d mqtt=%d rssi=%d\n",
                       DEVICE_ID, modeName(mode), WiFi.status() == WL_CONNECTED,
                       mqtt.connected(), WiFi.RSSI());
+        Serial.printf("   messageShowing=%d\n", messageShowing());
     }
 }
 
