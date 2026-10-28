@@ -5,7 +5,8 @@
  *
  *  Two lamps. Both run this identical firmware; DEVICE_ID in config.h ("A" or
  *  "B") is the only difference. Everyday light is the aurora: mint, cyan, sky,
- *  lavender and pink, with cool-white highlights. Idle is dark. Every
+ *  lavender and pink, with cool-white highlights. Happy uses the pastel
+ *  rainbow, mellow deep blues and love warm pinks. Idle is dark. Every
  *  animation draws each LED on the ring separately, so light moves round it.
  *
  *  GESTURES — on your own lamp
@@ -40,9 +41,19 @@
  *                   while you both hold. Either letting go fades both out
  *                   over 3 s. Nothing resumes.
  *
+ *  FEELINGS (SECRETS_ENABLED) — a burst of quick taps
+ *    3 taps             Happy     a fast, fluttering rainbow
+ *    4 taps             Mellow    slow deep blues, with ice falling
+ *    5 taps             Love      pink heartbeats
+ *    6+ taps            nothing, so mashing the lamp sets nothing off
+ *  Feelings play on both lamps until a tap on either, or for
+ *  SHOW_AUTO_OFF_MS at most. That tap ends the show on both and isn't sent
+ *  as a tap. A run of taps just before a hold is dropped: it's a plain hold.
+ *
  *  PRIORITY — one mode drives the LEDs at a time
  *      1 hold together   2 live hold (hers or yours)
- *      3 the answer      4 her tap waiting
+ *      3 the answer      4 her tap waiting, or a feeling: these
+ *                          share a level, so the newest wins
  *      6 your tap waiting, idle, the lamp light (and fades): anything may
  *        interrupt these
  *    A lower-priority event never interrupts a higher one and is not queued.
@@ -59,6 +70,9 @@
  *    {"type":"ACK","id":"B-9f8e7d6c-3","of":"A-1a2b3c4d-7"}
  *    {"type":"HOLD_START","id":"A-1a2b3c4d-8","hold":"A-1a2b3c4d-8"}
  *    {"type":"HOLD_END","id":"A-1a2b3c4d-12","hold":"A-1a2b3c4d-8"}
+ *    {"type":"SECRET_GESTURE","id":"A-1a2b3c4d-13","fx":"love",
+ *     "seed":2779096485,"at":1792566909123}
+ *    {"type":"SHOW_END","id":"B-9f8e7d6c-5","of":"A-1a2b3c4d-13"}
  *
  *    Nothing on the signal topic is retained: these are moments, not state.
  *    A lamp that was unplugged simply misses them and boots dark.
@@ -74,6 +88,20 @@
  *    power cut, her WiFi, a lost HOLD_END — the receiver ends the hold itself.
  *    It also ends it at once if the broker says her lamp went offline or this
  *    lamp loses its own connection.
+ *
+ *  SHOWS — decided once, by the lamp that saw them
+ *    The lamp whose sensor recognised a feeling works out which
+ *    show it is and publishes SECRET_GESTURE; the other lamp just plays it,
+ *    so the two never disagree. "at" is a moment SECRET_LEAD_MS ahead on the
+ *    shared NTP clock, so both lamps start together; one arriving
+ *    SECRET_LATE_MS after that is dropped. "seed" makes both lamps' random
+ *    patterns identical. A show is
+ *    only played here if it went out: offline, the lamp sends its tap spark
+ *    instead.
+ *
+ *    A tap during a show ends it on both lamps. SHOW_END names the
+ *    SECRET_GESTURE it ends, so one that crosses a newer show is ignored, and
+ *    each lamp fades to what it rests on: dark, or its lamp light.
  *
  *  HOLD TOGETHER — no coordinator
  *    Each lamp sees "my finger is down" and "her hold is live" and decides
@@ -142,10 +170,17 @@ static const Rgb PASTELS[] = {
     { 160, 205, 255 },   // 5 sky blue
     { 200, 178, 255 },   // 6 lavender
 };
+static const uint8_t PASTEL_COUNT = sizeof(PASTELS) / sizeof(PASTELS[0]);
 // Everyday light: the cool end of the rainbow, plus pink.
 static const Rgb AURORA[] = { PASTELS[3], PASTELS[4], PASTELS[5], PASTELS[6], PASTELS[0] };
 static const uint8_t AURORA_COUNT = sizeof(AURORA) / sizeof(AURORA[0]);
 static const uint8_t FLY_COLOURS[] = { 1, 3, 4 };  // her tap's fireflies: cyan, lavender, pink
+static const Rgb PINK_WHITE = { 255, 222, 236 };   // love's heartbeats
+static const Rgb ROSE       = { 255, 120, 170 };   // love: deeper than pink, so the beats show against it
+static const Rgb LOVE[]     = { PASTELS[0], PASTELS[1], ROSE };
+// Mellow: deep blue, periwinkle, soft cyan, sky and indigo.
+static const Rgb MELLOW[]   = { { 70, 110, 255 }, { 120, 160, 255 }, PASTELS[4], PASTELS[5], { 150, 130, 255 } };
+static const uint8_t MELLOW_COUNT = sizeof(MELLOW) / sizeof(MELLOW[0]);
 
 // Brightest any animation may get, as a fraction of MAX_BRIGHTNESS (which
 // stays the USB power cap). Enforced once, per LED, in writeRing().
@@ -159,7 +194,7 @@ static const float LED_GAMMA = 2.6f;
 //  TIMING
 // ============================================================================
 
-// Gesture recognition. Settable in config.h; see
+// Gesture recognition and the shows. Settable in config.h; see
 // config.example.h for how to choose them. Defaults here keep an older
 // config.h compiling.
 #ifndef HOLD_THRESHOLD_MS
@@ -171,9 +206,22 @@ static const float LED_GAMMA = 2.6f;
 #ifndef TAP_WAIT_MS
 #define TAP_WAIT_MS 120000
 #endif
+#ifndef SECRETS_ENABLED
+#define SECRETS_ENABLED 1
+#endif
+#ifndef SEQUENCE_WINDOW_MS
+#define SEQUENCE_WINDOW_MS 2500
+#endif
 #ifndef LAMP_AUTO_OFF_MS
 #define LAMP_AUTO_OFF_MS (5UL * 60UL * 60UL * 1000UL)
 #endif
+#ifndef SHOW_AUTO_OFF_MS
+#define SHOW_AUTO_OFF_MS (5UL * 60UL * 1000UL)
+#endif
+
+// A run MASH_TAPS long or longer is mashing, and does nothing; before a hold
+// it's dropped like any other run, leaving a plain hold.
+static const uint8_t  MASH_TAPS            = 6;
 
 static const uint32_t DEBOUNCE_MS          = 40;
 
@@ -188,11 +236,23 @@ static const uint32_t ACCEPT_SWEEP_MS      = 800;    // the answer floods round 
 static const uint32_t ACCEPT_MS            = 3400;   //   then glows, dimming, until the fade
 static const uint32_t FADE_OUT_MS          = 3000;   // every fade to dark
 static const uint32_t TAP_FLASH_MS         = 900;    // your tap's spark, once round
-static const uint32_t TRANSITION_MS        = 300;    // blend into a hold
+static const uint32_t TRANSITION_MS        = 300;    // blend into a hold or a show
 static const float    HOLD_TX_LEVEL        = 0.3f;   // your own lamp while you hold
 static const uint32_t CURRENT_LAP_MS       = 3000;   // her hold's light, once round
 static const uint32_t SHARED_WAVE_MS       = 4500;   // hold-together's waves, once round
 static const uint8_t  SHARED_WAVES         = 3;      // white crests on the ring at once
+
+static const uint32_t BURST_MS             = 600;    // happy bursting out of pixel 0
+static const uint32_t HAPPY_TURN_MS        = 1800;   // happy's rainbow, once round
+static const uint32_t HAPPY_DASH_MS        = 900;    // happy's white dash, once round
+static const uint32_t MELLOW_TURN_MS       = 24000;  // mellow's blues, once round
+static const uint32_t MELLOW_BREATHE_MS    = 7000;   // mellow, one slow breath
+static const uint32_t MELLOW_SWELL_MS      = 16000;  // mellow's swell, once round
+static const uint8_t  FALL_SPECKS          = 6;      // mellow's ice, falling at once
+static const uint32_t LOVE_BEAT_MS         = 1200;   // love, one lub-dub
+static const uint32_t LOVE_DRIFT_MS        = 9000;   // love's warm glow, once round
+static const uint32_t SECRET_LEAD_MS       = 250;    // shows start this far ahead, so hers can start with yours
+static const uint32_t SECRET_LATE_MS       = 4000;   // a show arriving later than this is dropped
 
 static const uint32_t HOLD_HEARTBEAT_MS    = 1000;   // HOLD_START repeat while holding
 static const uint32_t HOLD_TIMEOUT_MS      = 3000;   // no repeat for this long = hold over
@@ -217,7 +277,30 @@ enum Mode : uint8_t {
     M_LAMP_ON,    // lamp light: a white supernova opening into the aura
     M_LAMP,       // lamp light: the aura, until a double tap or LAMP_AUTO_OFF_MS
     M_LAMP_OFF,   // lamp light: collapsing back into a point, then dark
+    // Shows: both lamps, until a tap or SHOW_AUTO_OFF_MS, then a fade. Keep
+    // them last; isShow() relies on it.
+    M_HAPPY, M_MELLOW, M_LOVE
 };
+
+struct Show { const char* name; Mode mode; };
+static const Show SHOWS[] = {
+    { "happy",  M_HAPPY },
+    { "mellow", M_MELLOW },
+    { "love",   M_LOVE },
+};
+static const uint8_t SHOW_COUNT = sizeof(SHOWS) / sizeof(SHOWS[0]);
+
+static bool isShow(Mode m) { return m >= M_HAPPY; }
+
+static const Show* showFor(Mode m) {
+    for (uint8_t k = 0; k < SHOW_COUNT; k++) if (SHOWS[k].mode == m) return &SHOWS[k];
+    return nullptr;
+}
+
+static const Show* showNamed(const char* name) {
+    for (uint8_t k = 0; k < SHOW_COUNT; k++) if (!strcmp(SHOWS[k].name, name)) return &SHOWS[k];
+    return nullptr;
+}
 
 static uint8_t priorityOf(Mode m) {
     switch (m) {
@@ -225,12 +308,19 @@ static uint8_t priorityOf(Mode m) {
         case M_HOLD_RX:
         case M_HOLD_TX: return 2;
         case M_ACCEPT:  return 3;
-        case M_WAITING: return 4;
-        default:        return 6;     // your tap waiting, idle, the lamp light, fades
+        case M_WAITING: return 4;     // shares a level with every show: the newest wins
+        case M_SENT:
+        case M_IDLE:
+        case M_FADE:
+        case M_LAMP_ON:
+        case M_LAMP:
+        case M_LAMP_OFF: return 6;
+        default:        return 4;     // every show
     }
 }
 
 static const char* modeName(Mode m) {
+    if (isShow(m)) return showFor(m)->name;
     switch (m) {
         case M_IDLE: return "idle";        case M_WAITING: return "waiting";
         case M_SENT: return "sent";        case M_ACCEPT: return "answered";
@@ -249,7 +339,7 @@ static Px mix(Px a, Px b, float t) {
 }
 
 static Mode     mode = M_IDLE;
-static uint32_t modeStartedAt = 0;
+static uint32_t modeStartedAt = 0;      // may be a moment ahead: see playShow()
 static Px       shown[NUM_PIXELS];      // what's on the ring right now
 static Px       from[NUM_PIXELS];       // what was on it when the mode changed
 
@@ -275,9 +365,16 @@ static String   peerHoldId;
 static String   spentPeerHoldId;        // her hold that already ended a hold-together
 static uint32_t peerHoldSeenAt = 0;
 
+// The show playing now. Both lamps get the same seed, so their "random"
+// patterns match, and both know the id of the SECRET_GESTURE that started
+// it, so a SHOW_END about an older show can't end this one.
+static uint32_t showSeed = 0;
+static String   showId;
+
 // Touch.
 static bool     touchRaw = false, touchStable = false, touchHeld = false;
 static uint32_t touchChangedAt = 0, pressStartedAt = 0, lastReleaseAt = 0;
+static uint32_t burstStartedAt = 0;     // first press of the current run of taps
 static uint8_t  tapCount = 0;
 
 // Message ids.
@@ -287,7 +384,7 @@ static String   seenIds[16];
 static uint8_t  seenNext  = 0;
 static String   peerPrefix;             // "B-" on lamp A: her ids start with it
 
-// Clock shared by both lamps, for hold-together.
+// Clock shared by both lamps, for hold-together and starting shows together.
 static bool     timeSynced   = false;
 static uint32_t epochAtSync  = 0;
 static uint32_t millisAtSync = 0;
@@ -401,10 +498,58 @@ static bool publishHold(const char* type, bool log = true) {
 }
 
 // ============================================================================
+//  SHOWS
+// ============================================================================
+
+// Starts a show at local time `startAt` unless something more important is
+// showing. A show replaces a show, and her waiting tap: they never stack.
+static bool playShow(Mode m, uint32_t startAt) {
+    if (priorityOf(mode) < priorityOf(m)) {
+        Serial.printf("[show] %s ignored: %s showing\n", showFor(m)->name, modeName(mode));
+        return false;
+    }
+    setMode(m);
+    modeStartedAt = startAt;            // a moment ahead, so both lamps start together
+    Serial.printf("[show] playing %s\n", showFor(m)->name);
+    return true;
+}
+
+// A feeling recognised on this lamp. Published first and only
+// played if it went out, so an offline lamp never shows a shared moment
+// alone; it sends its spark instead, like a tap.
+static void launchShow(Mode m) {
+    uint32_t seed = esp_random();
+    JsonDocument doc;
+    doc["type"] = "SECRET_GESTURE";
+    doc["fx"]   = showFor(m)->name;
+    doc["seed"] = seed;
+    if (timeSynced) doc["at"] = syncedMillis() + SECRET_LEAD_MS;
+    if (!publish(doc)) {
+        tapFlashAt = millis();
+        return;
+    }
+    showSeed = seed;
+    showId   = doc["id"] | "";      // publish() stamped it
+    playShow(m, millis() + (timeSynced ? SECRET_LEAD_MS : 0));
+}
+
+// A tap during a show ends it on both lamps: each fades to what it rests on,
+// dark or its lamp light. The tap isn't also sent as a tap.
+static void endShow() {
+    Serial.printf("[tap] %s ended -> SHOW_END\n", modeName(mode));
+    JsonDocument doc;
+    doc["type"] = "SHOW_END";
+    doc["of"]   = showId;
+    publish(doc);
+    setMode(M_FADE);
+}
+
+// ============================================================================
 //  INTERACTIONS
 // ============================================================================
 
-// Her tap. Lower priority than any hold or answer, and not queued.
+// Her tap. Lower priority than any hold or answer, and not queued. It shares
+// a level with the shows, so it replaces one, and a newer show replaces it.
 static void receiveTap(const char* id) {
     if (priorityOf(mode) < priorityOf(M_WAITING)) {
         Serial.printf("[lamp] tap ignored: %s showing\n", modeName(mode));
@@ -533,6 +678,33 @@ static void serviceHoldHeartbeat() {
 //  INBOUND
 // ============================================================================
 
+// A show she recognised. She already decided which; this lamp just plays it,
+// starting when she does.
+static void receiveShow(JsonDocument& doc) {
+    if (!SECRETS_ENABLED) {
+        Serial.println("[show] ignored: shows are off on this lamp");
+        return;
+    }
+    const Show* s = showNamed(doc["fx"] | "");
+    if (!s) {
+        Serial.println("[show] unknown show, ignoring");
+        return;
+    }
+    uint32_t startAt = millis();
+    uint64_t at = doc["at"] | (uint64_t)0;
+    if (at && timeSynced) {
+        int64_t ahead = (int64_t)at - (int64_t)syncedMillis();
+        if (ahead < -(int64_t)SECRET_LATE_MS) {
+            Serial.println("[show] arrived too late, dropped");
+            return;
+        }
+        startAt += (int32_t)constrain(ahead, (int64_t)-1000, (int64_t)1000);   // late: join it partway
+    }
+    showSeed = doc["seed"] | 0U;
+    showId   = doc["id"] | "";
+    playShow(s->mode, startAt);
+}
+
 static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
     if (topicStatusPeer == topic) {
         bool online = (len == 6 && !memcmp(payload, "online", 6));
@@ -574,6 +746,17 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
         Serial.println("[mqtt] rx HOLD_END");
         if (peerHoldId == hold) peerHold = false;
         if (spentPeerHoldId == hold) spentPeerHoldId = "";
+    } else if (!strcmp(type, "SECRET_GESTURE")) {
+        Serial.printf("[mqtt] rx SECRET_GESTURE (%s)\n", doc["fx"] | "?");
+        receiveShow(doc);
+    } else if (!strcmp(type, "SHOW_END")) {
+        // Only the show it names: one that crossed a newer show is stale.
+        if (isShow(mode) && showId == (doc["of"] | "")) {
+            Serial.printf("[mqtt] rx SHOW_END: %s ended\n", modeName(mode));
+            setMode(M_FADE);
+        } else {
+            Serial.println("[mqtt] rx SHOW_END for a show not playing here, ignoring");
+        }
     }
     // Anything else (including the old firmware's messages) is ignored.
 }
@@ -600,6 +783,13 @@ static float smooth(float t) {
 // A soft bell: 1 at x = 0, falling to 0 at |x| = half.
 static float bump(float x, float half) {
     return smooth(1.0f - fabsf(x) / half);
+}
+
+// A heartbeat's shape over 0.6 s: quick up, slower down. 0 outside it.
+static float pulse(float ms) {
+    if (ms <= 0) return 0;
+    if (ms < 120) return smooth(ms / 120);
+    return 1 - smooth((ms - 120) / 480);
 }
 
 // How far pixel i is behind a light at `head`, going backwards round the ring.
@@ -667,6 +857,10 @@ static Px gradient(const Rgb* stops, uint8_t n, float h, float level) {
     float x = h * n;
     uint8_t a = (uint8_t)x % n;
     return mix(px(stops[a], level), px(stops[(a + 1) % n], level), x - floorf(x));
+}
+
+static Px rainbow(float h, float level) {
+    return gradient(PASTELS, PASTEL_COUNT, h, level);
 }
 
 // The aurora at pixel i: curtains of colour drifting at different speeds.
@@ -824,6 +1018,68 @@ static Px sharedGlow(uint8_t i) {
     return mix(p, px(COOL_WHITE, MAX_LEVEL), 0.85f * s);
 }
 
+// --- Feelings: 3, 4 and 5 taps ----------------------------------------------
+// They play until a tap, for minutes, so every phase is taken modulo its own
+// period: sin() of a float clock that large has lost its precision.
+
+// A burst out of pixel 0 that opens happy.
+static float burstFront(uint32_t dt) {
+    return (NUM_PIXELS / 2 + 2) * smooth((float)dt / BURST_MS);
+}
+
+static float burstReveal(uint8_t i, uint32_t dt) {
+    return smooth((burstFront(dt) - fromStart(i)) / 2.0f);
+}
+
+static float burstEdge(uint8_t i, uint32_t dt) {
+    return (1 - smooth((float)dt / BURST_MS)) * bump(fromStart(i) - burstFront(dt), 2.5f);
+}
+
+// Happy: the pastel rainbow spinning fast, every LED fluttering on its own
+// quick beat, a white dash racing round and speckle everywhere. The flutters
+// are out of step, so the ring as a whole never flashes.
+static Px happy(uint8_t i, uint32_t dt, uint32_t seed) {
+    float lit = burstReveal(i, dt);
+    uint32_t beat = 180 + (uint32_t)(140 * rand01(i, seed));   // each LED's own flutter, in whole ms
+    float flutter = 0.5f + 0.5f * sinf(TAU * ((float)(dt % beat) / beat + rand01(i, seed + 1)));
+    Px p = rainbow((float)i / NUM_PIXELS - (float)(dt % HAPPY_TURN_MS) / HAPPY_TURN_MS, (0.3f + 0.4f * flutter) * lit);
+    p = mix(p, px(COOL_WHITE, MAX_LEVEL), 0.7f * lit * glint(i, NUM_PIXELS * (float)(dt % HAPPY_DASH_MS) / HAPPY_DASH_MS));
+    p = mix(p, px(COOL_WHITE, MAX_LEVEL), 0.9f * lit * sparkle(i, dt, 320, 120, 0.3f, seed + 2));
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), burstEdge(i, dt));
+}
+
+// Mellow: deep blues drifting slowly round and breathing, with icy speckles
+// falling: each appears near pixel 0 and drifts down one side towards the
+// far side of the ring, at its own pace, fading as it goes.
+static Px mellow(uint8_t i, uint32_t dt, uint32_t seed) {
+    float breathe = 0.5f - 0.5f * cosf(TAU * (float)(dt % MELLOW_BREATHE_MS) / MELLOW_BREATHE_MS);
+    float swell = 0.5f + 0.5f * sinf(TAU * ((float)i / NUM_PIXELS - (float)(dt % MELLOW_SWELL_MS) / MELLOW_SWELL_MS));
+    float level = (0.22f + 0.1f * breathe + 0.06f * swell) * smooth((float)dt / 2000);
+    Px p = gradient(MELLOW, MELLOW_COUNT, (float)i / NUM_PIXELS + (float)(dt % MELLOW_TURN_MS) / MELLOW_TURN_MS, level);
+    Px ice = mix(px(COOL_WHITE, MAX_LEVEL), px(PASTELS[4], MAX_LEVEL), 0.3f);
+    for (uint8_t k = 0; k < FALL_SPECKS; k++) {
+        uint32_t every = 4000 + (uint32_t)(3000 * rand01(k, seed));
+        float u = (float)((dt + (uint32_t)(every * rand01(k, seed + 1))) % every) / every;
+        float top = 3 * rand01(k, seed + 2);
+        float y = top + (NUM_PIXELS / 2 + 1 - top) * u;
+        uint8_t j = k % 2 == 0 ? i : (NUM_PIXELS - i) % NUM_PIXELS;   // every other one falls down the other side
+        float seen = smooth(u * 6) * (1 - smooth((u - 0.55f) / 0.45f)) * smooth((float)dt / 1500);
+        p = mix(p, ice, 0.75f * seen * min(1.0f, glint(j, y) + 0.5f * trail(j, y, 1.5f)));
+    }
+    return p;
+}
+
+// Love: a warm pink and peach glow, lub-dub heartbeats rippling out from
+// pixel 0, and rose speckles.
+static Px love(uint8_t i, uint32_t dt, uint32_t seed) {
+    Px warm = gradient(LOVE, 3, (float)i / NUM_PIXELS + (float)(dt % LOVE_DRIFT_MS) / LOVE_DRIFT_MS,
+                       0.26f * smooth((float)dt / 800));
+    float beat = (float)(dt % LOVE_BEAT_MS) - fromStart(i) * 22;
+    float thump = min(1.0f, pulse(beat) + 0.75f * pulse(beat - 260));
+    Px p = mix(warm, px(PINK_WHITE, MAX_LEVEL), 0.8f * thump);
+    return mix(p, px(ROSE, MAX_LEVEL), 0.8f * sparkle(i, dt, 1100, 380, 0.25f, seed));
+}
+
 // --- Lamp light: a double tap with nothing waiting --------------------------
 // An aura of soft cool pastels drifting slowly round: two bands of brightness
 // travelling opposite ways at different speeds, so it never sits still and
@@ -881,6 +1137,8 @@ static void updateTimers(uint32_t now) {
         setMode(M_FADE);
     } else if (mode == M_ACCEPT && dt >= ACCEPT_MS) {
         setMode(M_FADE);        // the flood's last glow, out over 3 s
+    } else if (isShow(mode) && dt >= SHOW_AUTO_OFF_MS) {
+        setMode(M_FADE);        // nobody tapped: one left playing in an empty room still ends
     } else if (mode == M_FADE && dt >= FADE_OUT_MS) {
         setMode(lampOn ? M_LAMP : M_IDLE);
     } else if (mode == M_LAMP_ON && dt >= LAMP_ON_MS) {
@@ -904,6 +1162,9 @@ static Px targetFor(uint8_t i, uint32_t dt) {
     case M_HOLD_TX:   return holdingGlow(i, dt);
     case M_HOLD_RX:   return livingCurrent(i, dt);
     case M_SHARED:    return sharedGlow(i);
+    case M_HAPPY:     return happy(i, dt, showSeed);
+    case M_MELLOW:    return mellow(i, dt, showSeed);
+    case M_LOVE:      return love(i, dt, showSeed);
     case M_LAMP_ON:   return lampIgnite(i, dt);
     case M_LAMP:      return lampGlow(i);
     case M_LAMP_OFF:  return lampCollapse(i, dt);
@@ -913,13 +1174,14 @@ static Px targetFor(uint8_t i, uint32_t dt) {
 }
 
 // How far pixel i has blended from what was showing into the current mode.
-// Most modes take the whole ring at once. Her tap's bloom and the answer's
-// flood sweep it in behind their moving edge instead, so a tap during her
-// glow blooms over it rather than dimming it first.
+// Most modes take the whole ring at once. Her tap's bloom, the answer's flood
+// and happy's burst sweep it in behind their moving edge instead, so a tap
+// during her glow blooms over it rather than dimming it first.
 static float entryWeight(uint8_t i, uint32_t dt) {
     switch (mode) {
     case M_WAITING: return min(1.0f, bloomReveal(i, dt) + bloomLight(i, dt));
     case M_ACCEPT:  return min(1.0f, acceptReveal(i, dt) + acceptEdge(i, dt));
+    case M_HAPPY:   return min(1.0f, burstReveal(i, dt) + burstEdge(i, dt));
     case M_FADE:    return smooth((float)dt / FADE_OUT_MS);
     default:        return smooth((float)dt / TRANSITION_MS);
     }
@@ -927,15 +1189,18 @@ static float entryWeight(uint8_t i, uint32_t dt) {
 
 static void renderFrame() {
     uint32_t now = millis();
-    updateTimers(now);
-    uint32_t dt = now - modeStartedAt;
+    // A show can be set to start a moment ahead so both lamps start it
+    // together. Until then the ring holds what it had.
+    if ((int32_t)(now - modeStartedAt) >= 0) updateTimers(now);
+    bool started = (int32_t)(now - modeStartedAt) >= 0;
+    uint32_t dt = started ? now - modeStartedAt : 0;
 
     uint32_t ft = now - tapFlashAt;
     if (tapFlashAt && ft >= TAP_FLASH_MS) tapFlashAt = 0;
 
     for (uint8_t i = 0; i < NUM_PIXELS; i++) {
         // Blend from what was showing at the last mode change into this mode.
-        Px out = mix(from[i], targetFor(i, dt), entryWeight(i, dt));
+        Px out = started ? mix(from[i], targetFor(i, dt), entryWeight(i, dt)) : from[i];
         // Your own tap: its spark, over whatever is showing.
         if (tapFlashAt) out = mix(out, gradient(AURORA, AURORA_COUNT, (float)i / NUM_PIXELS, MAX_LEVEL), sendSpark(i, ft));
         shown[i] = out;
@@ -949,7 +1214,7 @@ static void renderFrame() {
 
 // The lamp light: a double tap with nothing to answer turns this lamp into an
 // ordinary lamp, and another turns it off again. Local only: hers doesn't
-// change. Ignored while a hold or her tap is playing; your own tap's
+// change. Ignored while a hold, a show or her tap is playing; your own tap's
 // waiting firefly gives way to it.
 static void toggleLamp() {
     if (priorityOf(mode) < priorityOf(M_LAMP)) {
@@ -966,7 +1231,11 @@ static void toggleLamp() {
 static void dispatchTaps(uint8_t n) {
     // Her tap comes first, always: one tap answers it, and so does an
     // excited double tap, which would otherwise be lost to the lamp light.
-    if (n <= 2 && messageShowing()) { sendAck(); return; }
+    // Next, a tap ends a show on both lamps, and goes no further.
+    if (n <= 2) {
+        if (messageShowing()) { sendAck(); return; }
+        if (isShow(mode))     { endShow(); return; }
+    }
     if (n == 1) {
         sendTap();
         return;
@@ -975,7 +1244,14 @@ static void dispatchTaps(uint8_t n) {
         toggleLamp();
         return;
     }
-    Serial.printf("[tap] %u taps ignored\n", n);
+    if (!SECRETS_ENABLED || n >= MASH_TAPS) {
+        Serial.printf("[tap] %u taps ignored\n", n);
+        return;
+    }
+    Serial.printf("[tap] %u taps -> %s\n", n, n == 3 ? "happy" : n == 4 ? "mellow" : "love");
+    if (n == 3)      launchShow(M_HAPPY);
+    else if (n == 4) launchShow(M_MELLOW);
+    else             launchShow(M_LOVE);
 }
 
 static void serviceTouch() {
@@ -988,6 +1264,7 @@ static void serviceTouch() {
     if (touchStable && !touchHeld) {                    // press
         touchHeld = true;
         pressStartedAt = now;
+        if (tapCount == 0) burstStartedAt = now;
     } else if (touchStable && touchHeld) {              // holding
         if (!holdActive && now - pressStartedAt >= HOLD_THRESHOLD_MS) {
             tapCount = 0;           // taps just before a hold are dropped: it's a plain hold
@@ -1000,11 +1277,15 @@ static void serviceTouch() {
     }
 
     // Taps are only decided once the double-tap window has passed with no
-    // further touch, so a double tap can never also send a single tap.
+    // further touch, so a double tap can never also send a single tap, and a
+    // feeling never sends the taps it's made of.
     if (tapCount > 0 && !touchHeld && now - lastReleaseAt >= DOUBLE_TAP_WINDOW_MS) {
         uint8_t n = tapCount;
         tapCount = 0;
-        dispatchTaps(n);
+        if (n > 2 && lastReleaseAt - burstStartedAt > SEQUENCE_WINDOW_MS)
+            Serial.printf("[tap] %u taps too spread out for a feeling, ignored\n", n);
+        else
+            dispatchTaps(n);
     }
 }
 
@@ -1080,19 +1361,25 @@ static void serviceSerial() {
         dispatchTaps(1);
     } else if (line == "ACK") {             // = double tap
         dispatchTaps(2);
+    } else if (line.startsWith("TAPS ")) {  // = n quick taps
+        dispatchTaps((uint8_t)constrain(line.substring(5).toInt(), 1, 9));
     } else if (line == "HOLD") {            // = finger down
         if (!holdActive) startLocalHold();
     } else if (line == "RELEASE") {         // = finger up
         if (holdActive && !touchHeld) endLocalHold();
     } else if (line == "LAMP") {            // = double tap with nothing waiting
         toggleLamp();
+    } else if (line.startsWith("SHOW ")) {  // = any show, as if recognised here
+        const Show* s = showNamed(line.substring(5).c_str());
+        if (s) launchShow(s->mode);
+        else Serial.println("[show] no such show: happy, mellow or love");
     } else if (line == "STATUS") {
         Serial.printf("id=%s mode=%s wifi=%d mqtt=%d rssi=%d synced=%d\n",
                       DEVICE_ID, modeName(mode), WiFi.status() == WL_CONNECTED,
                       mqtt.connected(), WiFi.RSSI(), timeSynced);
         Serial.printf("   holding=%d spent=%d peerHold=%d messageShowing=%d\n",
                       holdActive, holdSpent, peerHoldAlive(), messageShowing());
-        Serial.printf("   lamp=%d\n", lampOn);
+        Serial.printf("   lamp=%d secrets=%d\n", lampOn, SECRETS_ENABLED);
     }
 }
 
@@ -1137,7 +1424,7 @@ void setup() {
     Serial.printf("[wifi] connected, ip=%s rssi=%d\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
-    // UTC only: the clock just keeps hold-together in step.
+    // UTC only: the clock just keeps hold-together and the shows in step.
     configTime(0, 0, NTP_SERVER);
 
     net.setCACert(MQTT_ROOT_CA);

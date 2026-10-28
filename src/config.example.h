@@ -70,8 +70,8 @@
 
 // How long after a tap the lamp waits for another one, in ms. A single tap
 // is sent only once this passes, so it's also the delay before a tap goes
-// out. Raise it (up to about 450) if double taps are being read as two
-// single taps.
+// out. Raise it (up to about 450) if double taps or feeling taps are being
+// read as separate single taps.
 #define DOUBLE_TAP_WINDOW_MS 300
 
 // How long her tap waits on your lamp for you to tap back, in ms, and how
@@ -85,7 +85,25 @@
 // next double tap. A duration from switching on, never a time of day.
 #define LAMP_AUTO_OFF_MS (5UL * 60UL * 60UL * 1000UL)
 
-// NTP. Keeps hold-together in step on both lamps.
+// ---------------------------------------------------------------------------
+// FEELINGS — quick runs of taps
+// ---------------------------------------------------------------------------
+// Set these the same on both lamps.
+
+// 0 keeps only the everyday gestures (tap, tap back, hold, hold together,
+// lamp light). 1 adds the feelings.
+#define SECRETS_ENABLED 1
+
+// The longest a run of quick taps may take, first press to last release, in
+// ms. Slower runs are ignored, so a slow 3-tap isn't mistaken for a feeling.
+#define SEQUENCE_WINDOW_MS 2500
+
+// A feeling plays until a tap on either lamp, or this long at most, in ms,
+// so one left playing in an empty room still ends. Not the lamp light, which
+// has LAMP_AUTO_OFF_MS.
+#define SHOW_AUTO_OFF_MS (5UL * 60UL * 1000UL)
+
+// NTP. Keeps hold-together and the shows in step on both lamps.
 #define NTP_SERVER "pool.ntp.org"
 
 // ---------------------------------------------------------------------------
