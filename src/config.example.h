@@ -68,11 +68,22 @@
 // taps start counting as holds.
 #define HOLD_THRESHOLD_MS 250
 
+// How long after a tap the lamp waits for another one, in ms. A single tap
+// is sent only once this passes, so it's also the delay before a tap goes
+// out. Raise it (up to about 450) if double taps are being read as two
+// single taps.
+#define DOUBLE_TAP_WINDOW_MS 300
+
 // How long her tap waits on your lamp for you to tap back, in ms, and how
 // long your own lamp's firefly circles waiting for hers. Long enough that
 // she can walk into the room and still see it; much past a few minutes and
 // an answer stops feeling like a reply. Set it the same on both lamps.
 #define TAP_WAIT_MS 120000
+
+// Lamp light (a double tap with nothing waiting) turns itself off after this
+// long, in ms, so a forgotten light still ends dark. 0 = stays on until the
+// next double tap. A duration from switching on, never a time of day.
+#define LAMP_AUTO_OFF_MS (5UL * 60UL * 60UL * 1000UL)
 
 // NTP. Keeps hold-together in step on both lamps.
 #define NTP_SERVER "pool.ntp.org"

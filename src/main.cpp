@@ -17,10 +17,18 @@
  *                   then one dim firefly circles while you wait. Neither says
  *                   the tap arrived. Another tap blooms again and restarts
  *                   both waits; animations never stack.
- *    Tap back       "Miss you too". A tap while her tap is waiting or fading
- *                   answers it: bright aurora floods both lamps, then dims
- *                   down to dark. This is the only confirmation that a tap
- *                   reached her.
+ *    Tap back       "Miss you too". A tap (or a double tap) while her tap is
+ *                   waiting or fading answers it: bright aurora floods both
+ *                   lamps, then dims down to dark, or to the lamp light. This
+ *                   is the only confirmation that a tap reached her.
+ *    Double tap,    Lamp light. With nothing waiting, a double tap turns this
+ *    nothing waiting  lamp into a light to live by: a white point bursts round
+ *                   the ring like a supernova and opens into an aura of soft
+ *                   cool pastels drifting slowly round. Another double tap
+ *                   collapses it back into the point and out. Hers doesn't
+ *                   change. Anything that plays meanwhile goes back to the
+ *                   aura, not to dark, and it turns itself off after
+ *                   LAMP_AUTO_OFF_MS.
  *    Hold           "I'm here with you". On her lamp a white light glides
  *                   round the ring trailing aurora and stardust for as long
  *                   as you hold, then fades out over 3 s when you let go.
@@ -35,7 +43,7 @@
  *  PRIORITY — one mode drives the LEDs at a time
  *      1 hold together   2 live hold (hers or yours)
  *      3 the answer      4 her tap waiting
- *      6 your tap waiting, idle (and fades): anything may
+ *      6 your tap waiting, idle, the lamp light (and fades): anything may
  *        interrupt these
  *    A lower-priority event never interrupts a higher one and is not queued.
  *    A higher one replaces a lower one outright, and so does a newer one on
@@ -157,8 +165,14 @@ static const float LED_GAMMA = 2.6f;
 #ifndef HOLD_THRESHOLD_MS
 #define HOLD_THRESHOLD_MS 250
 #endif
+#ifndef DOUBLE_TAP_WINDOW_MS
+#define DOUBLE_TAP_WINDOW_MS 300
+#endif
 #ifndef TAP_WAIT_MS
 #define TAP_WAIT_MS 120000
+#endif
+#ifndef LAMP_AUTO_OFF_MS
+#define LAMP_AUTO_OFF_MS (5UL * 60UL * 60UL * 1000UL)
 #endif
 
 static const uint32_t DEBOUNCE_MS          = 40;
@@ -199,7 +213,10 @@ enum Mode : uint8_t {
     M_HOLD_TX,    // you're holding: a soft glow
     M_HOLD_RX,    // she's holding: a light gliding round
     M_SHARED,     // both holding: waves in step
-    M_FADE,       // fading to dark; anything may interrupt
+    M_FADE,       // fading to dark, or to the lamp light; anything may interrupt
+    M_LAMP_ON,    // lamp light: a white supernova opening into the aura
+    M_LAMP,       // lamp light: the aura, until a double tap or LAMP_AUTO_OFF_MS
+    M_LAMP_OFF,   // lamp light: collapsing back into a point, then dark
 };
 
 static uint8_t priorityOf(Mode m) {
@@ -209,7 +226,7 @@ static uint8_t priorityOf(Mode m) {
         case M_HOLD_TX: return 2;
         case M_ACCEPT:  return 3;
         case M_WAITING: return 4;
-        default:        return 6;     // your tap waiting, idle, fades
+        default:        return 6;     // your tap waiting, idle, the lamp light, fades
     }
 }
 
@@ -218,7 +235,8 @@ static const char* modeName(Mode m) {
         case M_IDLE: return "idle";        case M_WAITING: return "waiting";
         case M_SENT: return "sent";        case M_ACCEPT: return "answered";
         case M_HOLD_TX: return "holding";  case M_HOLD_RX: return "her-hold";
-        case M_SHARED: return "together";
+        case M_SHARED: return "together";  case M_LAMP_ON: return "lamp-on";
+        case M_LAMP: return "lamp";        case M_LAMP_OFF: return "lamp-off";
         default: return "fade";
     }
 }
@@ -241,6 +259,10 @@ static String   lastRxTapId;            // the tap an answer acknowledges
 static uint32_t messageSeed    = 0;     // where her tap's fireflies start and its twinkles fall
 static uint32_t tapFlashAt     = 0;     // local "tap registered" spark
 
+// The lamp light. On, it's what the ring rests on instead of dark.
+static bool     lampOn   = false;
+static uint32_t lampOnAt = 0;
+
 // Your hold.
 static bool     holdActive = false;     // past the threshold (finger or serial HOLD)
 static bool     holdSpent  = false;     // ended a hold-together; ignored until release
@@ -255,7 +277,8 @@ static uint32_t peerHoldSeenAt = 0;
 
 // Touch.
 static bool     touchRaw = false, touchStable = false, touchHeld = false;
-static uint32_t touchChangedAt = 0, pressStartedAt = 0;
+static uint32_t touchChangedAt = 0, pressStartedAt = 0, lastReleaseAt = 0;
+static uint8_t  tapCount = 0;
 
 // Message ids.
 static uint32_t bootNonce = 0;
@@ -708,8 +731,8 @@ static Px bloomOver(Px base, uint8_t i, uint32_t dt) {
 // --- Her tap, waiting for your answer ---------------------------------------
 // The bloom leaves bright aurora that sinks to a low shimmer, and three
 // fireflies circle at their own speeds, each breathing on its own beat, with
-// now and then a single LED twinkling white. `rest` is the shimmer it sinks
-// to.
+// now and then a single LED twinkling white. `rest` is what it sinks to: the
+// shimmer, or the lamp light if it's on, so the room doesn't go dim.
 
 static Px waitingRest(uint8_t i, uint32_t dt) {
     return auroraAt(i, dt, 0.24f + 0.04f * cosf(TAU * (float)dt / WAIT_BREATHE_MS));
@@ -801,6 +824,53 @@ static Px sharedGlow(uint8_t i) {
     return mix(p, px(COOL_WHITE, MAX_LEVEL), 0.85f * s);
 }
 
+// --- Lamp light: a double tap with nothing waiting --------------------------
+// An aura of soft cool pastels drifting slowly round: two bands of brightness
+// travelling opposite ways at different speeds, so it never sits still and
+// never quite repeats. Always between 40% and 70%, bright enough to live by.
+// It runs on its own clock from switch-on, so whatever plays over it fades
+// back to the aura exactly where it would have been.
+//
+// It lights like a supernova: a white point gathers at pixel 0 and bursts
+// both ways round the ring, the aura opening up behind it. Turning it off
+// runs that backwards: the aura falls back into the point and goes out.
+static const uint32_t LAMP_ON_MS  = 2000;
+static const uint32_t LAMP_OFF_MS = 2200;
+
+static Px lampGlow(uint8_t i) {
+    float at = (float)i / NUM_PIXELS, t = (float)(millis() - lampOnAt);
+    float a = sinf(TAU * (at - t / 12000));
+    float b = sinf(TAU * (2 * at + t / 20000) + 1.7f);
+    float hue = 0.4f + 0.3f * sinf(TAU * (at + t / 30000)) + 0.1f * b;
+    return gradient(AURORA, AURORA_COUNT, hue, 0.55f + 0.1f * a + 0.05f * b);
+}
+
+static Px lampIgnite(uint8_t i, uint32_t dt) {
+    const float t = dt, a = fromStart(i), reach = NUM_PIXELS / 2 + 2;
+    if (t < 500) return px(COOL_WHITE, MAX_LEVEL * smooth(t / 500) * bump(a, 2.0f));
+    float u = min(1.0f, (t - 500) / 1100), s = 1 - u;
+    float front = reach * (1 - s * s * s);
+    float lit = smooth((front - a) / 2);
+    // White just behind the burst, turning into the aura further back.
+    float settled = max(smooth((front - a) / 6), smooth((t - 1600) / 400));
+    Px p = mix(px(COOL_WHITE, MAX_LEVEL * lit), mix(Px{ 0, 0, 0 }, lampGlow(i), lit), settled);
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), (1 - u) * bump(a - front, 2.5f));   // the burst's edge
+}
+
+static Px lampCollapse(uint8_t i, uint32_t dt) {
+    const float t = dt, a = fromStart(i), reach = NUM_PIXELS / 2 + 2;
+    float u = min(1.0f, t / 1600);
+    float front = reach * (1 - smooth(u));
+    Px p = mix(Px{ 0, 0, 0 }, lampGlow(i), smooth((front - a) / 2));
+    float core = smooth(u) * (1 - smooth((t - 1600) / 600));
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), core * bump(a, 2.0f));
+}
+
+// What the ring rests on: the lamp light while it's on, otherwise dark.
+static Px restGlow(uint8_t i) {
+    return lampOn ? lampGlow(i) : Px{ 0, 0, 0 };
+}
+
 // End timed modes before drawing.
 static void updateTimers(uint32_t now) {
     uint32_t dt = now - modeStartedAt;
@@ -812,19 +882,33 @@ static void updateTimers(uint32_t now) {
     } else if (mode == M_ACCEPT && dt >= ACCEPT_MS) {
         setMode(M_FADE);        // the flood's last glow, out over 3 s
     } else if (mode == M_FADE && dt >= FADE_OUT_MS) {
+        setMode(lampOn ? M_LAMP : M_IDLE);
+    } else if (mode == M_LAMP_ON && dt >= LAMP_ON_MS) {
+        setMode(M_LAMP);
+    } else if (mode == M_LAMP_OFF && dt >= LAMP_OFF_MS) {
         setMode(M_IDLE);
+    }
+    // A duration, not a time of day: so a forgotten light still ends dark.
+    if (lampOn && LAMP_AUTO_OFF_MS && now - lampOnAt >= LAMP_AUTO_OFF_MS) {
+        Serial.println("[lamp] lamp light off (auto)");
+        lampOn = false;
+        if (mode == M_LAMP) setMode(M_LAMP_OFF);
     }
 }
 
 static Px targetFor(uint8_t i, uint32_t dt) {
     switch (mode) {
-    case M_WAITING:   return waiting(i, dt, messageSeed, waitingRest(i, dt));
-    case M_SENT:      return sentGlow(i, dt, Px{ 0, 0, 0 });
+    case M_WAITING:   return waiting(i, dt, messageSeed, lampOn ? lampGlow(i) : waitingRest(i, dt));
+    case M_SENT:      return sentGlow(i, dt, restGlow(i));
     case M_ACCEPT:    return accepted(i, dt);
     case M_HOLD_TX:   return holdingGlow(i, dt);
     case M_HOLD_RX:   return livingCurrent(i, dt);
     case M_SHARED:    return sharedGlow(i);
-    default:          return { 0, 0, 0 };       // M_IDLE, and what M_FADE fades to
+    case M_LAMP_ON:   return lampIgnite(i, dt);
+    case M_LAMP:      return lampGlow(i);
+    case M_LAMP_OFF:  return lampCollapse(i, dt);
+    case M_FADE:      return restGlow(i);       // to whatever the ring rests on
+    default:          return { 0, 0, 0 };       // M_IDLE
     }
 }
 
@@ -863,10 +947,35 @@ static void renderFrame() {
 //  TOUCH
 // ============================================================================
 
-// A tap answers her tap if one is showing; otherwise it goes to her.
-static void tapped() {
-    if (messageShowing()) sendAck();
-    else sendTap();
+// The lamp light: a double tap with nothing to answer turns this lamp into an
+// ordinary lamp, and another turns it off again. Local only: hers doesn't
+// change. Ignored while a hold or her tap is playing; your own tap's
+// waiting firefly gives way to it.
+static void toggleLamp() {
+    if (priorityOf(mode) < priorityOf(M_LAMP)) {
+        Serial.printf("[tap] double ignored: %s showing\n", modeName(mode));
+        return;
+    }
+    lampOn = !lampOn;
+    lampOnAt = millis();
+    Serial.printf("[tap] double -> lamp light %s\n", lampOn ? "on" : "off");
+    setMode(lampOn ? M_LAMP_ON : M_LAMP_OFF);
+}
+
+// A run of quick taps, finished.
+static void dispatchTaps(uint8_t n) {
+    // Her tap comes first, always: one tap answers it, and so does an
+    // excited double tap, which would otherwise be lost to the lamp light.
+    if (n <= 2 && messageShowing()) { sendAck(); return; }
+    if (n == 1) {
+        sendTap();
+        return;
+    }
+    if (n == 2) {
+        toggleLamp();
+        return;
+    }
+    Serial.printf("[tap] %u taps ignored\n", n);
 }
 
 static void serviceTouch() {
@@ -881,12 +990,21 @@ static void serviceTouch() {
         pressStartedAt = now;
     } else if (touchStable && touchHeld) {              // holding
         if (!holdActive && now - pressStartedAt >= HOLD_THRESHOLD_MS) {
+            tapCount = 0;           // taps just before a hold are dropped: it's a plain hold
             startLocalHold();
         }
     } else if (!touchStable && touchHeld) {             // release
         touchHeld = false;
         if (holdActive) endLocalHold();
-        else tapped();
+        else { tapCount++; lastReleaseAt = now; }
+    }
+
+    // Taps are only decided once the double-tap window has passed with no
+    // further touch, so a double tap can never also send a single tap.
+    if (tapCount > 0 && !touchHeld && now - lastReleaseAt >= DOUBLE_TAP_WINDOW_MS) {
+        uint8_t n = tapCount;
+        tapCount = 0;
+        dispatchTaps(n);
     }
 }
 
@@ -958,18 +1076,23 @@ static void serviceSerial() {
 
     if (line == "RESET_WIFI") {
         wm.resetSettings(); delay(200); ESP.restart();
-    } else if (line == "PING") {            // = a tap
-        tapped();
+    } else if (line == "PING") {            // = single tap
+        dispatchTaps(1);
+    } else if (line == "ACK") {             // = double tap
+        dispatchTaps(2);
     } else if (line == "HOLD") {            // = finger down
         if (!holdActive) startLocalHold();
     } else if (line == "RELEASE") {         // = finger up
         if (holdActive && !touchHeld) endLocalHold();
+    } else if (line == "LAMP") {            // = double tap with nothing waiting
+        toggleLamp();
     } else if (line == "STATUS") {
         Serial.printf("id=%s mode=%s wifi=%d mqtt=%d rssi=%d synced=%d\n",
                       DEVICE_ID, modeName(mode), WiFi.status() == WL_CONNECTED,
                       mqtt.connected(), WiFi.RSSI(), timeSynced);
         Serial.printf("   holding=%d spent=%d peerHold=%d messageShowing=%d\n",
                       holdActive, holdSpent, peerHoldAlive(), messageShowing());
+        Serial.printf("   lamp=%d\n", lampOn);
     }
 }
 
