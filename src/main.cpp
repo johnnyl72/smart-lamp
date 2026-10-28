@@ -26,8 +26,14 @@
  *                   as you hold, then fades out over 3 s when you let go.
  *                   Yours glows softly to show the hold is live.
  *
+ *  GESTURES — together
+ *    Hold together  "We're connected". Both lamps glow in aurora with three
+ *                   white waves racing round them, in step and sparkling,
+ *                   while you both hold. Either letting go fades both out
+ *                   over 3 s. Nothing resumes.
+ *
  *  PRIORITY — one mode drives the LEDs at a time
- *      2 live hold (hers or yours)
+ *      1 hold together   2 live hold (hers or yours)
  *      3 the answer      4 her tap waiting
  *      6 your tap waiting, idle (and fades): anything may
  *        interrupt these
@@ -61,6 +67,18 @@
  *    It also ends it at once if the broker says her lamp went offline or this
  *    lamp loses its own connection.
  *
+ *  HOLD TOGETHER — no coordinator
+ *    Each lamp sees "my finger is down" and "her hold is live" and decides
+ *    alone. Both see the same two facts, so both agree. When either lets go,
+ *    the other lamp's still-held hold is spent: it sends HOLD_END and stops
+ *    repeating, and the lamp that let go ignores the rest of that hold id.
+ *    Otherwise the remaining finger would carry on as a solo hold and light
+ *    the other lamp straight back up.
+ *
+ *    The waves take their position from the NTP clock, so both lamps show the
+ *    same frame. The answer's flood starts when each lamp hears the tap back,
+ *    so the two line up to within network latency.
+ *
  *  WIFI
  *    If the saved network can't be joined at power-up, the lamp opens the
  *    "Lamp Setup" portal by itself (first boot, new router). No touch can
@@ -80,6 +98,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <WiFiManager.h>
 #include <esp_system.h>
+#include <time.h>
 
 #include "config.h"
 
@@ -158,6 +177,8 @@ static const uint32_t TAP_FLASH_MS         = 900;    // your tap's spark, once r
 static const uint32_t TRANSITION_MS        = 300;    // blend into a hold
 static const float    HOLD_TX_LEVEL        = 0.3f;   // your own lamp while you hold
 static const uint32_t CURRENT_LAP_MS       = 3000;   // her hold's light, once round
+static const uint32_t SHARED_WAVE_MS       = 4500;   // hold-together's waves, once round
+static const uint8_t  SHARED_WAVES         = 3;      // white crests on the ring at once
 
 static const uint32_t HOLD_HEARTBEAT_MS    = 1000;   // HOLD_START repeat while holding
 static const uint32_t HOLD_TIMEOUT_MS      = 3000;   // no repeat for this long = hold over
@@ -177,11 +198,13 @@ enum Mode : uint8_t {
     M_ACCEPT,     // a tap answered: aurora floods both lamps, then dims
     M_HOLD_TX,    // you're holding: a soft glow
     M_HOLD_RX,    // she's holding: a light gliding round
+    M_SHARED,     // both holding: waves in step
     M_FADE,       // fading to dark; anything may interrupt
 };
 
 static uint8_t priorityOf(Mode m) {
     switch (m) {
+        case M_SHARED:  return 1;
         case M_HOLD_RX:
         case M_HOLD_TX: return 2;
         case M_ACCEPT:  return 3;
@@ -195,6 +218,7 @@ static const char* modeName(Mode m) {
         case M_IDLE: return "idle";        case M_WAITING: return "waiting";
         case M_SENT: return "sent";        case M_ACCEPT: return "answered";
         case M_HOLD_TX: return "holding";  case M_HOLD_RX: return "her-hold";
+        case M_SHARED: return "together";
         default: return "fade";
     }
 }
@@ -219,12 +243,14 @@ static uint32_t tapFlashAt     = 0;     // local "tap registered" spark
 
 // Your hold.
 static bool     holdActive = false;     // past the threshold (finger or serial HOLD)
+static bool     holdSpent  = false;     // ended a hold-together; ignored until release
 static String   localHoldId;
 static uint32_t lastHeartbeatAt = 0;
 
 // Her hold. Read through peerHoldAlive(), never the flag alone.
 static bool     peerHold = false;
 static String   peerHoldId;
+static String   spentPeerHoldId;        // her hold that already ended a hold-together
 static uint32_t peerHoldSeenAt = 0;
 
 // Touch.
@@ -237,6 +263,11 @@ static uint32_t eventSeq  = 0;
 static String   seenIds[16];
 static uint8_t  seenNext  = 0;
 static String   peerPrefix;             // "B-" on lamp A: her ids start with it
+
+// Clock shared by both lamps, for hold-together.
+static bool     timeSynced   = false;
+static uint32_t epochAtSync  = 0;
+static uint32_t millisAtSync = 0;
 
 // Connectivity.
 static uint32_t wifiDownSince = 0;
@@ -254,6 +285,11 @@ WiFiManager       wm;
 //  HELPERS
 // ============================================================================
 
+static uint64_t syncedMillis() {
+    if (!timeSynced) return millis();   // lamps drift apart; nobody sees both rooms
+    return (uint64_t)epochAtSync * 1000ULL + (millis() - millisAtSync);
+}
+
 // Every mode change starts from what's actually showing, so nothing snaps.
 static void setMode(Mode m) {
     mode = m;
@@ -269,6 +305,10 @@ static bool messageShowing() {
 // Her hold counts only while its repeats keep arriving and we can hear them.
 static bool peerHoldAlive() {
     return peerHold && mqtt.connected() && millis() - peerHoldSeenAt < HOLD_TIMEOUT_MS;
+}
+
+static bool localHoldLive() {
+    return holdActive && !holdSpent;
 }
 
 static String newEventId() {
@@ -399,6 +439,7 @@ static void sendAck() {
 
 static void startLocalHold() {
     holdActive = true;
+    holdSpent  = false;
     localHoldId = newEventId();
     Serial.println("[tap] hold -> HOLD_START");
     publishHold("HOLD_START");
@@ -406,15 +447,33 @@ static void startLocalHold() {
 }
 
 static void endLocalHold() {
-    Serial.println("[tap] release -> HOLD_END");
-    publishHold("HOLD_END");
+    if (!holdSpent) {
+        Serial.println("[tap] release -> HOLD_END");
+        publishHold("HOLD_END");
+    }
     holdActive = false;
+    holdSpent  = false;
+}
+
+// Either finger lifted during hold-together. Both lamps fade, and neither
+// hold may carry on as a solo hold: that would relight the other lamp.
+static void endHoldTogether() {
+    Serial.println("[lamp] hold together ended");
+    if (holdActive && !holdSpent) {
+        holdSpent = true;
+        publishHold("HOLD_END");
+    }
+    if (peerHold) {
+        spentPeerHoldId = peerHoldId;
+        peerHold = false;
+    }
+    setMode(M_FADE);
 }
 
 // Holds outrank everything else, so they're decided every loop from the two
 // facts both lamps can see: my finger, her hold.
 static void updateHolds() {
-    bool mine = holdActive;
+    bool mine = localHoldLive();
     bool hers = peerHoldAlive();
 
     if (peerHold && !hers) {
@@ -422,6 +481,15 @@ static void updateHolds() {
         peerHold = false;
     }
 
+    if (mode == M_SHARED) {
+        if (!mine || !hers) endHoldTogether();
+        return;
+    }
+    if (mine && hers) {
+        Serial.println("[lamp] holding together");
+        setMode(M_SHARED);
+        return;
+    }
     if (mode == M_HOLD_RX && !hers) { setMode(M_FADE); return; }
     if (mode == M_HOLD_TX && !mine) { setMode(M_FADE); return; }
 
@@ -431,7 +499,7 @@ static void updateHolds() {
 
 // While holding, repeat HOLD_START so her lamp knows the hold is still live.
 static void serviceHoldHeartbeat() {
-    if (!holdActive) return;
+    if (!localHoldLive()) return;
     uint32_t now = millis();
     if (now - lastHeartbeatAt < HOLD_HEARTBEAT_MS) return;
     lastHeartbeatAt = now;
@@ -473,6 +541,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
         receiveAck();
     } else if (!strcmp(type, "HOLD_START")) {
         const char* hold = doc["hold"] | "";
+        if (spentPeerHoldId == hold) return;    // it already ended a hold-together
         if (!peerHold || peerHoldId != hold) Serial.println("[mqtt] rx HOLD_START");
         peerHold = true;
         peerHoldId = hold;
@@ -481,6 +550,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
         const char* hold = doc["hold"] | "";
         Serial.println("[mqtt] rx HOLD_END");
         if (peerHoldId == hold) peerHold = false;
+        if (spentPeerHoldId == hold) spentPeerHoldId = "";
     }
     // Anything else (including the old firmware's messages) is ignored.
 }
@@ -714,6 +784,23 @@ static Px holdingGlow(uint8_t i, uint32_t dt) {
     return auroraAt(i, dt, HOLD_TX_LEVEL);
 }
 
+// --- Hold together: the shared glow -----------------------------------------
+// Aurora turning one way and three white waves racing the other, sparkling at
+// the crests and now and then in between.
+// Everything comes from the shared clock, so both lamps draw the same frame.
+static Px sharedGlow(uint8_t i) {
+    uint64_t t  = syncedMillis();
+    float at    = (float)i / NUM_PIXELS;
+    float waves = (float)(t % SHARED_WAVE_MS) / SHARED_WAVE_MS;
+    float drift = (float)(t % (4 * SHARED_WAVE_MS)) / (4 * SHARED_WAVE_MS);
+    float crest = 0.5f + 0.5f * cosf(TAU * SHARED_WAVES * (at - waves));
+    crest *= crest * crest;                 // narrow crests, a wide calm between
+    Px p = mix(gradient(AURORA, AURORA_COUNT, at + drift, 0.5f), px(COOL_WHITE, MAX_LEVEL), crest);
+    float s = max(sparkle(i, (uint32_t)t, 900, 350, 0.5f, 11) * smooth(crest * 3),
+                  0.6f * sparkle(i, (uint32_t)t, 1300, 300, 0.15f, 12));
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), 0.85f * s);
+}
+
 // End timed modes before drawing.
 static void updateTimers(uint32_t now) {
     uint32_t dt = now - modeStartedAt;
@@ -736,6 +823,7 @@ static Px targetFor(uint8_t i, uint32_t dt) {
     case M_ACCEPT:    return accepted(i, dt);
     case M_HOLD_TX:   return holdingGlow(i, dt);
     case M_HOLD_RX:   return livingCurrent(i, dt);
+    case M_SHARED:    return sharedGlow(i);
     default:          return { 0, 0, 0 };       // M_IDLE, and what M_FADE fades to
     }
 }
@@ -851,6 +939,17 @@ static void serviceMqtt() {
     }
 }
 
+static void serviceTime() {
+    if (timeSynced) return;
+    time_t t = time(nullptr);
+    if (t > 1700000000) {
+        epochAtSync  = (uint32_t)t;
+        millisAtSync = millis();
+        timeSynced   = true;    // set last — syncedMillis() reads the latches
+        Serial.printf("[ntp] synced: %lu\n", (unsigned long)epochAtSync);
+    }
+}
+
 // Typing into the serial monitor stands in for the touch sensor on the bench.
 static void serviceSerial() {
     if (!Serial.available()) return;
@@ -866,11 +965,11 @@ static void serviceSerial() {
     } else if (line == "RELEASE") {         // = finger up
         if (holdActive && !touchHeld) endLocalHold();
     } else if (line == "STATUS") {
-        Serial.printf("id=%s mode=%s wifi=%d mqtt=%d rssi=%d\n",
+        Serial.printf("id=%s mode=%s wifi=%d mqtt=%d rssi=%d synced=%d\n",
                       DEVICE_ID, modeName(mode), WiFi.status() == WL_CONNECTED,
-                      mqtt.connected(), WiFi.RSSI());
-        Serial.printf("   holding=%d peerHold=%d messageShowing=%d\n",
-                      holdActive, peerHoldAlive(), messageShowing());
+                      mqtt.connected(), WiFi.RSSI(), timeSynced);
+        Serial.printf("   holding=%d spent=%d peerHold=%d messageShowing=%d\n",
+                      holdActive, holdSpent, peerHoldAlive(), messageShowing());
     }
 }
 
@@ -915,6 +1014,9 @@ void setup() {
     Serial.printf("[wifi] connected, ip=%s rssi=%d\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
+    // UTC only: the clock just keeps hold-together in step.
+    configTime(0, 0, NTP_SERVER);
+
     net.setCACert(MQTT_ROOT_CA);
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     mqtt.setCallback(onMqttMessage);
@@ -925,6 +1027,7 @@ void setup() {
 void loop() {
     serviceWifi();
     serviceMqtt();
+    serviceTime();
     serviceTouch();
     serviceSerial();
     serviceHoldHeartbeat();

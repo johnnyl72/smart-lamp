@@ -74,6 +74,9 @@
 // an answer stops feeling like a reply. Set it the same on both lamps.
 #define TAP_WAIT_MS 120000
 
+// NTP. Keeps hold-together in step on both lamps.
+#define NTP_SERVER "pool.ntp.org"
+
 // ---------------------------------------------------------------------------
 // TLS ROOT CA
 // ---------------------------------------------------------------------------
