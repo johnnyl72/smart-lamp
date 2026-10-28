@@ -6,9 +6,9 @@
  *  Two lamps. Both run this identical firmware; DEVICE_ID in config.h ("A" or
  *  "B") is the only difference. Everyday light is the aurora: mint, cyan, sky,
  *  lavender and pink, with cool-white highlights. Happy uses the pastel
- *  rainbow, mellow deep blues, love warm pinks and the party the full
- *  saturated spectrum. Idle is dark. Every animation draws each LED on the
- *  ring separately, so light moves round it.
+ *  rainbow, mellow deep blues, love warm pinks, the party the full saturated
+ *  spectrum, and rave neon. Idle is dark. Every animation draws each LED on
+ *  the ring separately, so light moves round it.
  *
  *  GESTURES — on your own lamp
  *    Tap            "I miss you". On her lamp aurora light blooms both ways
@@ -42,19 +42,23 @@
  *                   while you both hold. Either letting go fades both out
  *                   over 3 s. Nothing resumes.
  *
- *  FEELINGS AND PARTY (SECRETS_ENABLED) — a burst of quick taps
+ *  FEELINGS, PARTY AND RAVE (SECRETS_ENABLED) — a burst of quick taps
  *    3 taps             Happy     a fast, fluttering rainbow
  *    4 taps             Mellow    slow deep blues, with ice falling
  *    5 taps             Love      pink heartbeats
  *    6 taps             Party     all ten effects in turn, 10 s each, in an
  *                                 order shuffled by the show's seed
+ *    2 taps + hold      Rave      a hold in neon, build and drop
  *    7+ taps            nothing, so mashing the lamp sets nothing off
  *  Feelings and the party play on both lamps until a tap on either, or for
  *  SHOW_AUTO_OFF_MS at most. That tap ends the show on both and isn't sent
- *  as a tap. A run of taps just before a hold is dropped: it's a plain hold.
+ *  as a tap. Rave is a real hold with a look: hold-together, heartbeats and
+ *  timeouts work exactly as for a plain hold, and hold-together raves if
+ *  either hold does. Any other run of taps just before a hold is dropped:
+ *  it's a plain hold.
  *
  *  PRIORITY — one mode drives the LEDs at a time
- *      1 hold together   2 live hold (hers or yours)
+ *      1 hold together   2 live hold (hers or yours, either look)
  *      3 the answer      4 her tap waiting, or a feeling or party: these
  *                          share a level, so the newest wins
  *      6 your tap waiting, idle, the lamp light (and fades): anything may
@@ -71,7 +75,7 @@
  *
  *    {"type":"TAP","id":"A-1a2b3c4d-7"}
  *    {"type":"ACK","id":"B-9f8e7d6c-3","of":"A-1a2b3c4d-7"}
- *    {"type":"HOLD_START","id":"A-1a2b3c4d-8","hold":"A-1a2b3c4d-8"}
+ *    {"type":"HOLD_START","id":"A-1a2b3c4d-8","hold":"A-1a2b3c4d-8","look":"rave"}
  *    {"type":"HOLD_END","id":"A-1a2b3c4d-12","hold":"A-1a2b3c4d-8"}
  *    {"type":"SECRET_GESTURE","id":"A-1a2b3c4d-13","fx":"love",
  *     "seed":2779096485,"at":1792566909123}
@@ -185,8 +189,7 @@ static const Rgb LOVE[]     = { PASTELS[0], PASTELS[1], ROSE };
 static const Rgb MELLOW[]   = { { 70, 110, 255 }, { 120, 160, 255 }, PASTELS[4], PASTELS[5], { 150, 130, 255 } };
 static const uint8_t MELLOW_COUNT = sizeof(MELLOW) / sizeof(MELLOW[0]);
 
-// Party only: the whole spectrum, saturated. No pure red: saturated red
-// flashing is the worst kind for photosensitive viewers.
+// Party only: the whole spectrum, saturated. No pure red, as for rave.
 static const Rgb SPECTRUM[] = {
     { 255,   0, 150 },   // 0 hot pink
     { 170,   0, 255 },   // 1 violet
@@ -198,6 +201,19 @@ static const Rgb SPECTRUM[] = {
     { 255, 110,   0 },   // 7 orange
 };
 static const uint8_t SPECTRUM_COUNT = sizeof(SPECTRUM) / sizeof(SPECTRUM[0]);
+
+// Rave only: full-saturation neon, the one loud thing the lamp does. No pure
+// red: saturated red flashing is the worst kind for photosensitive viewers.
+// One or two channels each, so they draw less than white.
+static const Rgb NEON[] = {
+    { 255,   0, 200 },   // 0 magenta
+    { 150,   0, 255 },   // 1 violet
+    {   0,  70, 255 },   // 2 electric blue
+    {   0, 255, 220 },   // 3 aqua
+    {  90, 255,   0 },   // 4 lime
+    { 255, 220,   0 },   // 5 yellow
+};
+static const uint8_t NEON_COUNT = sizeof(NEON) / sizeof(NEON[0]);
 
 // Brightest any animation may get, as a fraction of MAX_BRIGHTNESS (which
 // stays the USB power cap). Enforced once, per LED, in writeRing().
@@ -236,8 +252,10 @@ static const float LED_GAMMA = 2.6f;
 #define SHOW_AUTO_OFF_MS (5UL * 60UL * 1000UL)
 #endif
 
-// A run MASH_TAPS long or longer is mashing, and does nothing; before a hold
-// it's dropped like any other run, leaving a plain hold.
+// Rave is a double tap, then a third touch kept down. A run MASH_TAPS long or
+// longer is mashing, and does nothing; before a hold it's dropped like any
+// other run, leaving a plain hold.
+static const uint8_t  RAVE_TAPS            = 2;
 static const uint8_t  MASH_TAPS            = 7;
 
 static const uint32_t DEBOUNCE_MS          = 40;
@@ -271,9 +289,14 @@ static const uint32_t LOVE_DRIFT_MS        = 9000;   // love's warm glow, once r
 static const uint32_t PARTY_MS             = 10000;  // each party effect plays this long,
 static const uint32_t PARTY_FADE_MS        = 800;    //   fading into the next over this
 static const uint32_t CONFETTI_SLOT_MS     = 500;    // each LED's chance to pop comes round this often
-// Bass line's beat: 128 bpm. The whole ring kicks once a beat, so never below
-// 334 ms (3 flashes a second, the photosensitive-epilepsy limit).
+// Bass line's beat: 128 bpm. The whole ring kicks once a beat, so like rave's
+// it must stay above 334 ms.
 static const uint32_t BASS_BEAT_MS         = 469;
+// Rave's beat: 150 bpm. The whole ring flashes once a beat, so never below
+// 334 (3 flashes a second, the photosensitive-epilepsy limit).
+static const uint32_t RAVE_BEAT_MS         = 400;
+static const uint8_t  RAVE_BUILD_BEATS     = 4;      // the build, then...
+static const uint8_t  RAVE_LOOP_BEATS      = 16;     // ...the drop for the rest of the loop
 static const uint32_t SECRET_LEAD_MS       = 250;    // shows start this far ahead, so hers can start with yours
 static const uint32_t SECRET_LATE_MS       = 4000;   // a show arriving later than this is dropped
 
@@ -293,8 +316,8 @@ enum Mode : uint8_t {
     M_WAITING,    // her tap: a bloom sinking to a shimmer with fireflies, until answered or TAP_WAIT_MS
     M_SENT,       // your tap: one firefly circling while you wait for her answer
     M_ACCEPT,     // a tap answered: aurora floods both lamps, then dims
-    M_HOLD_TX,    // you're holding: a soft glow
-    M_HOLD_RX,    // she's holding: a light gliding round
+    M_HOLD_TX,    // you're holding: a soft glow, or rave in full
+    M_HOLD_RX,    // she's holding: a light gliding round, or rave
     M_SHARED,     // both holding: waves in step
     M_FADE,       // fading to dark, or to the lamp light; anything may interrupt
     M_LAMP_ON,    // lamp light: a white supernova opening into the aura
@@ -324,6 +347,17 @@ static const Show* showFor(Mode m) {
 static const Show* showNamed(const char* name) {
     for (uint8_t k = 0; k < SHOW_COUNT; k++) if (!strcmp(SHOWS[k].name, name)) return &SHOWS[k];
     return nullptr;
+}
+
+// A hold's look, set by the taps before it. Hold-together shows the higher of
+// the two lamps' looks, so the order matters.
+enum Look : uint8_t { L_PLAIN, L_RAVE };
+static const char* const LOOK_NAMES[] = { "plain", "rave" };
+static const uint8_t LOOK_COUNT = sizeof(LOOK_NAMES) / sizeof(LOOK_NAMES[0]);
+
+static Look lookNamed(const char* name) {
+    for (uint8_t k = 0; k < LOOK_COUNT; k++) if (!strcmp(name, LOOK_NAMES[k])) return (Look)k;
+    return L_PLAIN;
 }
 
 static uint8_t priorityOf(Mode m) {
@@ -381,11 +415,15 @@ static uint32_t lampOnAt = 0;
 static bool     holdActive = false;     // past the threshold (finger or serial HOLD)
 static bool     holdSpent  = false;     // ended a hold-together; ignored until release
 static String   localHoldId;
+static Look     localLook  = L_PLAIN;
+static uint32_t localSeed  = 0;         // its rave's colours, the same on her lamp
 static uint32_t lastHeartbeatAt = 0;
 
 // Her hold. Read through peerHoldAlive(), never the flag alone.
 static bool     peerHold = false;
 static String   peerHoldId;
+static Look     peerLook = L_PLAIN;
+static uint32_t peerSeed = 0;
 static String   spentPeerHoldId;        // her hold that already ended a hold-together
 static uint32_t peerHoldSeenAt = 0;
 
@@ -471,6 +509,14 @@ static bool alreadySeen(const char* id) {
     return false;
 }
 
+// A hold id, boiled down to a seed: both lamps know the id, so both draw the
+// same rave from it.
+static uint32_t seedOf(const String& s) {
+    uint32_t h = 2166136261U;
+    for (size_t k = 0; k < s.length(); k++) h = (h ^ (uint8_t)s[k]) * 16777619U;
+    return h;
+}
+
 // Gamma and MAX_BRIGHTNESS in one step, rounded once. gamma8() followed by
 // setBrightness() truncated twice, which blacked out the dim end of every
 // fade and trail.
@@ -513,11 +559,13 @@ static bool publish(JsonDocument& doc, bool log = true) {
     return ok;
 }
 
-// HOLD_START (first and every repeat) or HOLD_END for our hold.
+// HOLD_START (first and every repeat, so a lamp that missed the first still
+// learns the look) or HOLD_END for our hold.
 static bool publishHold(const char* type, bool log = true) {
     JsonDocument doc;
     doc["type"] = type;
     doc["hold"] = localHoldId;
+    if (localLook != L_PLAIN && !strcmp(type, "HOLD_START")) doc["look"] = LOOK_NAMES[localLook];
     return publish(doc, log);
 }
 
@@ -629,11 +677,13 @@ static void sendAck() {
     startAccept();
 }
 
-static void startLocalHold() {
+static void startLocalHold(Look look) {
     holdActive = true;
     holdSpent  = false;
+    localLook  = look;
     localHoldId = newEventId();
-    Serial.println("[tap] hold -> HOLD_START");
+    localSeed  = seedOf(localHoldId);
+    Serial.printf("[tap] hold (%s) -> HOLD_START\n", LOOK_NAMES[look]);
     publishHold("HOLD_START");
     lastHeartbeatAt = millis();
 }
@@ -678,7 +728,7 @@ static void updateHolds() {
         return;
     }
     if (mine && hers) {
-        Serial.println("[lamp] holding together");
+        Serial.printf("[lamp] holding together (%s)\n", LOOK_NAMES[max(localLook, peerLook)]);
         setMode(M_SHARED);
         return;
     }
@@ -761,9 +811,13 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
     } else if (!strcmp(type, "HOLD_START")) {
         const char* hold = doc["hold"] | "";
         if (spentPeerHoldId == hold) return;    // it already ended a hold-together
-        if (!peerHold || peerHoldId != hold) Serial.println("[mqtt] rx HOLD_START");
+        if (!peerHold || peerHoldId != hold) {
+            Serial.printf("[mqtt] rx HOLD_START (%s)\n", doc["look"] | "plain");
+            peerSeed = seedOf(String(hold));
+        }
         peerHold = true;
         peerHoldId = hold;
+        peerLook = lookNamed(doc["look"] | "plain");
         peerHoldSeenAt = millis();
     } else if (!strcmp(type, "HOLD_END")) {
         const char* hold = doc["hold"] | "";
@@ -796,6 +850,7 @@ static const float TAU             = 6.28318531f;  // one full turn, in radians
 static const float HEAD_PX         = 2.0f;   // a moving light's half-width; under ~1.5
                                              // it visibly hops from LED to LED
 static const float CURRENT_TAIL_PX = 4.0f;   // her hold's trail
+static const uint32_t STAR_SEED    = 0x5747A85;  // hold-together's rave: the same on both
 static const uint32_t ACCEPT_SEED  = 21;         // the answer's glints: the same on both
 
 static float smooth(float t) {
@@ -1031,14 +1086,57 @@ static Px livingCurrent(uint8_t i, uint32_t dt) {
     return mix(p, px(COOL_WHITE, MAX_LEVEL), glint(i, head));
 }
 
-// Your own lamp while you hold: a soft glow, so you know the hold is live.
+// Rave: hardcore at 150 bpm, in neon, looping for as long as the hold lasts.
+//   The build   two beams split from pixel 0 and whirl apart, faster and
+//               faster, over a rising neon swirl and thickening glitter, and
+//               meet back at pixel 0 on the drop.
+//   The drop    a white blast out of pixel 0. Then every beat kicks the whole
+//               ring in a new colour, rippling out from pixel 0, while two
+//               beams in clashing colours spin opposite ways and white glitter
+//               pops everywhere.
+// It opens on the build, so the first thing a hold gets is a drop. The whole
+// ring flashes at most once a beat; only single pixels and the beams go faster.
+static Px rave(uint8_t i, uint32_t t, uint32_t seed) {
+    uint32_t beat = t / RAVE_BEAT_MS;
+    uint32_t step = beat % RAVE_LOOP_BEATS;
+    float    u    = (float)(t % RAVE_BEAT_MS) / RAVE_BEAT_MS;   // through this beat
+    uint8_t  k    = nth(rand01(beat, seed), NEON_COUNT);
+    Rgb a = NEON[(k + 2) % NEON_COUNT], b = NEON[(k + 4) % NEON_COUNT];   // never the kick's colour
+
+    if (step < RAVE_BUILD_BEATS) {
+        float build = (step + u) / RAVE_BUILD_BEATS;
+        float laps  = 4 * build * build;    // speeding up steadily, a whole number of laps by the drop
+        Px p = gradient(NEON, NEON_COUNT, (float)i / NUM_PIXELS + laps / 2, 0.08f + 0.4f * build * build);
+        p = mix(p, px(a, MAX_LEVEL), glint(i, NUM_PIXELS * laps));
+        p = mix(p, px(b, MAX_LEVEL), glint(i, -NUM_PIXELS * laps));
+        return mix(p, px(COOL_WHITE, MAX_LEVEL), sparkle(i, t, 300, 120, 0.1f + 0.5f * build, seed));
+    }
+    float into = u * RAVE_BEAT_MS - fromStart(i) * 8;           // ripples out from pixel 0
+    float kick = smooth(into / 30) * expf(-max(0.0f, into) / 140);
+    Px p = px(NEON[k], 0.1f + 0.6f * kick);
+    if (step == RAVE_BUILD_BEATS) p = mix(p, px(COOL_WHITE, MAX_LEVEL), 0.9f * kick);   // the drop
+    float fwd = NUM_PIXELS * u;                                                         // once round a beat
+    float rev = NUM_PIXELS * (1 - (float)(t % (2 * RAVE_BEAT_MS)) / (2 * RAVE_BEAT_MS)); // back, half speed
+    p = mix(p, px(a, MAX_LEVEL), min(1.0f, trail(i, fwd, 3.0f) + glint(i, fwd)));
+    p = mix(p, px(b, MAX_LEVEL), glint(i, rev));
+    return mix(p, px(COOL_WHITE, MAX_LEVEL), 0.9f * sparkle(i, t, 400, 140, 0.35f, seed));
+}
+
+// A hold, drawn in its look.
+static Px holdLight(Look look, uint8_t i, uint32_t dt, uint32_t seed) {
+    return look == L_RAVE ? rave(i, dt, seed) : livingCurrent(i, dt);
+}
+
+// Your own lamp while you hold. A plain hold just glows softly. Rave plays in
+// full here too: the fun is for the one who made it as well.
 static Px holdingGlow(uint8_t i, uint32_t dt) {
-    return auroraAt(i, dt, HOLD_TX_LEVEL);
+    if (localLook == L_PLAIN) return auroraAt(i, dt, HOLD_TX_LEVEL);
+    return holdLight(localLook, i, dt, localSeed);
 }
 
 // --- Hold together: the shared glow -----------------------------------------
 // Aurora turning one way and three white waves racing the other, sparkling at
-// the crests and now and then in between.
+// the crests and now and then in between; or the rave, if either hold is one.
 // Everything comes from the shared clock, so both lamps draw the same frame.
 static Px sharedGlow(uint8_t i) {
     uint64_t t  = syncedMillis();
@@ -1047,7 +1145,10 @@ static Px sharedGlow(uint8_t i) {
     float drift = (float)(t % (4 * SHARED_WAVE_MS)) / (4 * SHARED_WAVE_MS);
     float crest = 0.5f + 0.5f * cosf(TAU * SHARED_WAVES * (at - waves));
     crest *= crest * crest;                 // narrow crests, a wide calm between
-    Px p = mix(gradient(AURORA, AURORA_COUNT, at + drift, 0.5f), px(COOL_WHITE, MAX_LEVEL), crest);
+    // A fixed seed for the rave: each lamp's own hold id would give each its own colours.
+    Px base = max(localLook, peerLook) == L_RAVE ? rave(i, (uint32_t)t, STAR_SEED)
+                                                 : gradient(AURORA, AURORA_COUNT, at + drift, 0.5f);
+    Px p = mix(base, px(COOL_WHITE, MAX_LEVEL), crest);
     float s = max(sparkle(i, (uint32_t)t, 900, 350, 0.5f, 11) * smooth(crest * 3),
                   0.6f * sparkle(i, (uint32_t)t, 1300, 300, 0.15f, 12));
     return mix(p, px(COOL_WHITE, MAX_LEVEL), 0.85f * s);
@@ -1362,7 +1463,7 @@ static Px targetFor(uint8_t i, uint32_t dt) {
     case M_SENT:      return sentGlow(i, dt, restGlow(i));
     case M_ACCEPT:    return accepted(i, dt);
     case M_HOLD_TX:   return holdingGlow(i, dt);
-    case M_HOLD_RX:   return livingCurrent(i, dt);
+    case M_HOLD_RX:   return holdLight(peerLook, i, dt, peerSeed);
     case M_SHARED:    return sharedGlow(i);
     case M_HAPPY:     return happy(i, dt, showSeed);
     case M_MELLOW:    return mellow(i, dt, showSeed);
@@ -1458,6 +1559,14 @@ static void dispatchTaps(uint8_t n) {
     else             launchShow(M_PARTY);
 }
 
+// The finger has stayed down past the hold threshold after `n` quick taps.
+// Only a double tap makes it a rave; any other run just before a hold is
+// dropped, so a stray tap can't turn "I'm here" into something else.
+static void holdAfterTaps(uint8_t n) {
+    tapCount = 0;
+    startLocalHold(SECRETS_ENABLED && n == RAVE_TAPS ? L_RAVE : L_PLAIN);
+}
+
 static void serviceTouch() {
     uint32_t now = millis();
     bool raw = digitalRead(PIN_TOUCH) == HIGH;
@@ -1471,8 +1580,9 @@ static void serviceTouch() {
         if (tapCount == 0) burstStartedAt = now;
     } else if (touchStable && touchHeld) {              // holding
         if (!holdActive && now - pressStartedAt >= HOLD_THRESHOLD_MS) {
-            tapCount = 0;           // taps just before a hold are dropped: it's a plain hold
-            startLocalHold();
+            // Taps too spread out to be one run make a plain hold.
+            bool quick = pressStartedAt - burstStartedAt <= SEQUENCE_WINDOW_MS;
+            holdAfterTaps(quick ? tapCount : 0);
         }
     } else if (!touchStable && touchHeld) {             // release
         touchHeld = false;
@@ -1567,8 +1677,8 @@ static void serviceSerial() {
         dispatchTaps(2);
     } else if (line.startsWith("TAPS ")) {  // = n quick taps
         dispatchTaps((uint8_t)constrain(line.substring(5).toInt(), 1, 9));
-    } else if (line == "HOLD") {            // = finger down
-        if (!holdActive) startLocalHold();
+    } else if (line == "HOLD" || line.startsWith("HOLD ")) {   // = [n taps, then] finger down
+        if (!holdActive) holdAfterTaps(line.length() > 5 ? (uint8_t)constrain(line.substring(5).toInt(), 0, 9) : 0);
     } else if (line == "RELEASE") {         // = finger up
         if (holdActive && !touchHeld) endLocalHold();
     } else if (line == "LAMP") {            // = double tap with nothing waiting
@@ -1581,8 +1691,9 @@ static void serviceSerial() {
         Serial.printf("id=%s mode=%s wifi=%d mqtt=%d rssi=%d synced=%d\n",
                       DEVICE_ID, modeName(mode), WiFi.status() == WL_CONNECTED,
                       mqtt.connected(), WiFi.RSSI(), timeSynced);
-        Serial.printf("   holding=%d spent=%d peerHold=%d messageShowing=%d\n",
-                      holdActive, holdSpent, peerHoldAlive(), messageShowing());
+        Serial.printf("   holding=%d (%s) spent=%d peerHold=%d (%s) messageShowing=%d\n",
+                      holdActive, LOOK_NAMES[localLook], holdSpent, peerHoldAlive(),
+                      LOOK_NAMES[peerLook], messageShowing());
         Serial.printf("   lamp=%d secrets=%d\n", lampOn, SECRETS_ENABLED);
     }
 }

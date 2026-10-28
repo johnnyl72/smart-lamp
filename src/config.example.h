@@ -86,12 +86,12 @@
 #define LAMP_AUTO_OFF_MS (5UL * 60UL * 60UL * 1000UL)
 
 // ---------------------------------------------------------------------------
-// FEELINGS AND PARTY — quick runs of taps
+// FEELINGS, PARTY AND RAVE — quick runs of taps, rave ending in a hold
 // ---------------------------------------------------------------------------
 // Set these the same on both lamps.
 
 // 0 keeps only the everyday gestures (tap, tap back, hold, hold together,
-// lamp light). 1 adds the feelings and the party.
+// lamp light). 1 adds the feelings, the party and rave.
 #define SECRETS_ENABLED 1
 
 // The longest a run of quick taps may take, first press to last release, in
