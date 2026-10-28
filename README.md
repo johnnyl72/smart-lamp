@@ -112,6 +112,10 @@ works out on its own that it's a shared hold, with no coordinator.
 
 - [`docs/GUIDE.md`](docs/GUIDE.md): the full written guide. Build steps,
   parts list, troubleshooting, how it works and every design decision.
+- Flow diagrams of the firmware's logic:
+  [a tap between the lamps](docs/diagrams/tap_flow.png),
+  [touch gestures](docs/diagrams/touch_gestures.png) and
+  [holds](docs/diagrams/hold_flow.png).
 - [`src/config.example.h`](src/config.example.h): settings template. Copy it
   to `src/config.h` (gitignored) and fill in your broker details.
 - [`3d-design/`](3d-design): the CadQuery scripts for the case.
