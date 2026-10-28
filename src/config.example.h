@@ -52,6 +52,11 @@
 // don't exist) but wrong.
 #define RING_PIXELS 24
 
+// Peak brightness, 0-255. The ring is powered through the ESP32's USB port, so
+// this caps current: keep RING_PIXELS * MAX_BRIGHTNESS at or below 2880
+// (24 LEDs: 120; 16 LEDs: 180). Animations peak at 70% of this.
+#define MAX_BRIGHTNESS 120
+
 // ---------------------------------------------------------------------------
 // TLS ROOT CA
 // ---------------------------------------------------------------------------
