@@ -2,9 +2,11 @@
 
 ESP32 firmware. Two lamps, one per person. Tap yours, hers glows.
 
-**Full spec is in README.md.** Read it before any non-trivial change — it
+**Full spec is in docs/GUIDE.md.** Read it before any non-trivial change — it
 carries the reasoning, the rejected alternatives, and the hardware details.
 This file is only the things that will break something if you don't know them.
+`README.md` is the short public page; its GIFs in `docs/media/` are recordings
+of the build guide's `LampAnim` scenes, so an animation change makes them stale.
 
 ## Build
 
@@ -68,13 +70,13 @@ otherwise untested rather than implying it works.
    Linked Lamp specifies 16 LEDs because the ring draws 5V from the ESP32's
    `VIN` pin (USB-powered, no separate supply). Any 24-LED ring, either size, needs `MAX_BRIGHTNESS` lowered to
    ~120 to keep the same current. Don't raise brightness or add white output
-   without checking the USB power budget in README Part 4, "Power".
+   without checking the USB power budget in GUIDE.md Part 4, "Power".
 
 7a. **The base rim and diffuser wall are frozen** (`LIP_IN = 0.5`,
    `DIFF_WALL = 0.4` in `3d-design/make_lamp.py`). Two bases are already
    printed. The 0.4 mm wall needs the Arachne wall generator in the
    diffuser's Bambu profile; don't "fix" a plate-only print by thickening
-   the wall. Reasoning in README, "Bigger lamp for 85–87 mm rings".
+   the wall. Reasoning in GUIDE.md, "Bigger lamp for 85–87 mm rings".
 
 8. **Both lamps run identical firmware.** `DEVICE_ID` ("A" or "B") is the only
    difference. Topics derive from it. Never create a second sketch variant.
@@ -146,15 +148,15 @@ otherwise untested rather than implying it works.
 ## Settled — don't reopen without being asked
 
 15. **Our own firmware, not Linked Lamp's.** We use their 3D models only.
-    Reasoning in README Part 5, "Why our own firmware".
+    Reasoning in GUIDE.md Part 5, "Why our own firmware".
 16. **EMQX Serverless.** HiveMQ retired its free tier (no new clusters after
     2026-09-30, shutdown 2026-12-31). AWS IoT Core is the fallback if EMQX's
     free tier goes too: cents a month, but device certs and a firmware change.
-    Reversible — it's four config fields. README Part 5, "Why EMQX Serverless".
+    Reversible — it's four config fields. GUIDE.md Part 5, "Why EMQX Serverless".
 17. **CoronaLamps rejected.** 40+ solder joints, hardcoded WiFi, known
-    interrupt crash. README Part 5, "Why not CoronaLamps".
+    interrupt crash. GUIDE.md Part 5, "Why not CoronaLamps".
 18. **Cuckoo doors parked.** Blocked on enclosure geometry, not software.
-    README Part 5, "Parked: the cuckoo doors".
+    GUIDE.md Part 5, "Parked: the cuckoo doors".
 
 ## Style
 
